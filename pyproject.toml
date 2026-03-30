@@ -1,0 +1,44 @@
+[project]
+name = "kvswitch"
+version = "0.1.0"
+description = "KVSwitch"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "black>=26.3.1",
+    "codespell>=2.4.2",
+    "isort>=8.0.1",
+    "mypy>=1.19.1",
+    "pytest>=9.0.2",
+    "ruff>=0.15.8",
+]
+
+[tool.isort]
+profile = "black"
+skip = ["3rdparty", ".venv"]
+
+[tool.ruff]
+target-version = "py312"
+exclude = ["3rdparty", ".venv"]
+
+[tool.black]
+force-exclude = "(3rdparty|\\.venv)"
+
+[tool.mypy]
+explicit_package_bases = false
+ignore_missing_imports = true
+files = ["kvswitch"]
+
+[tool.codespell]
+ignore-words-list = ["assertIn"]
+skip = ["3rdparty", ".venv", "data", "results"]
+
+[tool.pyright]
+exclude = ["3rdparty", ".venv", "**/node_modules", "**/__pycache__", "**/.*"]
+extraPaths = ["3rdparty/vllm"]
+deprecateTypingAliases = true
+reportDeprecated = "warning"
+reportPrivateImportUsage = "none"

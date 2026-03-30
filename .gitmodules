@@ -1,0 +1,4 @@
+[submodule "3rdparty/vllm"]
+	path = 3rdparty/vllm
+	url = https://github.com/kaiitunnz/vllm
+	branch = kaiitunnz/v0.16.0
