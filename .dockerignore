@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+results/
+data/ShareGPT_V3_unfiltered_cleaned_split.json
+tmp/

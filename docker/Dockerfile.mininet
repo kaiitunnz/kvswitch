@@ -1,0 +1,46 @@
+# Base image: Mininet + OVS pre-installed.
+# https://github.com/iwaseyusuke/docker-mininet
+FROM iwaseyusuke/mininet
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Need certificates plus git because the vendored vLLM build uses
+# setuptools-scm/vcs-versioning during wheel preparation.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates git \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- uv package manager ---
+# uv can download its own standalone Python 3.12 — no PPA needed.
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+
+# --- Project setup ---
+# Use a venv outside the project dir so it doesn't collide with the
+# host's .venv when the project is bind-mounted at runtime.
+ENV UV_PROJECT_ENVIRONMENT=/opt/kvswitch-venv
+
+WORKDIR /kvswitch
+
+# 1. Install locked third-party Python deps without installing the local
+#    project yet.
+COPY pyproject.toml uv.lock ./
+RUN uv venv --python 3.12 \
+    && uv sync --frozen --no-install-project
+
+# 2. Install vendored vLLM in its own layer.
+COPY .git/modules/3rdparty/vllm ./.git/modules/3rdparty/vllm
+COPY 3rdparty/vllm ./3rdparty/vllm
+RUN VLLM_USE_PRECOMPILED=1 \
+    VLLM_PRECOMPILED_WHEEL_COMMIT=89a77b10846fd96273cce78d86d2556ea582d26e \
+    uv pip install --python /opt/kvswitch-venv/bin/python3 ./3rdparty/vllm
+
+# 3. Copy the runtime project files and install the local package.
+COPY kvswitch ./kvswitch
+COPY exp ./exp
+COPY scripts ./scripts
+COPY docker ./docker
+COPY README.md ./
+RUN uv pip install --python /opt/kvswitch-venv/bin/python3 --editable . --no-deps
+
+ENTRYPOINT ["/kvswitch/docker/entrypoint.sh"]
+CMD ["exp/run_mininet.py"]
