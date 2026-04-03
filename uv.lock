@@ -337,6 +337,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "mininet" },
+    { name = "pandas" },
 ]
 
 [package.optional-dependencies]
@@ -348,7 +349,6 @@ dev = [
     { name = "matplotlib" },
     { name = "mypy" },
     { name = "numpy" },
-    { name = "pandas" },
     { name = "pytest" },
     { name = "ruff" },
     { name = "seaborn" },
@@ -364,7 +364,7 @@ requires-dist = [
     { name = "mininet", specifier = ">=2.3.0.dev6" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.19.1" },
     { name = "numpy", marker = "extra == 'dev'", specifier = ">=2.4.4" },
-    { name = "pandas", marker = "extra == 'dev'", specifier = ">=3.0.1" },
+    { name = "pandas", specifier = ">=3.0.1" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0.2" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.15.8" },
     { name = "seaborn", marker = "extra == 'dev'", specifier = ">=0.13.2" },

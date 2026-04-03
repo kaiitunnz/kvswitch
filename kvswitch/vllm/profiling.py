@@ -1,16 +1,15 @@
-"""TTFT profiling for vLLM with prefix caching on/off.
+"""TTFT and TPOT profiling for vLLM with prefix caching on/off.
 
-Measures time-to-first-token (TTFT) across different prompt lengths and
-prefix sharing ratios at batch size 1.  The vLLM UDP server is
-automatically spawned in a separate process so that measurements
-include the full UDP network-stack overhead.
+Measures time-to-first-token (TTFT) and time-per-output-token (TPOT)
+across different prompt lengths and prefix sharing ratios at batch size 1.
+The vLLM UDP server is automatically spawned in a separate process so that
+measurements include the full UDP network-stack overhead.
 
 Results are saved as CSV for downstream analysis and plotting.
 """
 
 import argparse
 import asyncio
-import csv
 import logging
 import multiprocessing as mp
 import random
@@ -18,6 +17,9 @@ import time
 from dataclasses import asdict, dataclass, field
 from multiprocessing.process import BaseProcess
 from pathlib import Path
+from typing import Any
+
+import pandas as pd
 
 from kvswitch.utils.logger import setup_logging
 from kvswitch.vllm.client import VLLMClient
@@ -28,15 +30,18 @@ CSV_COLUMNS = [
     "prompt_tokens",
     "prefix_ratio",
     "trial",
+    "output_tokens",
     "ttft",
+    "tpot",
     "engine_ttft",
+    "engine_tpot",
     "num_cached_tokens",
 ]
 
 
 @dataclass
 class ProfilingConfig:
-    """Configuration for a TTFT profiling run."""
+    """Configuration for a TTFT/TPOT profiling run."""
 
     prompt_lengths: list[int] = field(
         default_factory=lambda: [128, 256, 512, 1024, 2048, 4096]
@@ -45,8 +50,8 @@ class ProfilingConfig:
         default_factory=lambda: [0.0, 0.25, 0.5, 0.75, 1.0]
     )
     num_trials: int = 5
-    max_output_tokens: int = 1
-    output_path: Path = Path("results/profiling/ttft_traces.csv")
+    max_output_tokens: int = 16
+    output_path: Path = Path("results/profiling/inference_traces.csv")
     seed: int = 42
     token_id_min: int = 100
     token_id_max: int = 10000
@@ -54,13 +59,16 @@ class ProfilingConfig:
 
 @dataclass
 class ProfilingResult:
-    """Single TTFT measurement."""
+    """Single TTFT/TPOT measurement."""
 
     prompt_tokens: int
     prefix_ratio: float
     trial: int
+    output_tokens: int
     ttft: float
+    tpot: float | None
     engine_ttft: float | None
+    engine_tpot: float | None
     num_cached_tokens: int
 
 
@@ -212,31 +220,56 @@ async def wait_for_server(
 # ---------------------------------------------------------------------------
 
 
-async def measure_ttft(
+def _extract_engine_tpot(metrics: dict[str, Any]) -> float | None:
+    """Derive engine TPOT from vLLM per-request metrics when available."""
+    raw = metrics.get("mean_time_per_output_token")
+    if raw is not None:
+        return float(raw)
+
+    num_generation_tokens = metrics.get("num_generation_tokens")
+    first_token_ts = metrics.get("first_token_ts")
+    last_token_ts = metrics.get("last_token_ts")
+    if num_generation_tokens is None or first_token_ts is None or last_token_ts is None:
+        return None
+
+    num_generation_tokens = int(num_generation_tokens)
+    if num_generation_tokens <= 1:
+        return 0.0
+
+    return (float(last_token_ts) - float(first_token_ts)) / (num_generation_tokens - 1)
+
+
+async def measure_generation(
     client: VLLMClient,
     prompt_token_ids: list[int],
-    max_tokens: int = 1,
+    max_tokens: int,
     temperature: float = 0.0,
-) -> tuple[float, float | None, int]:
-    """Send one request via UDP and return (wall_ttft, engine_ttft, num_cached)."""
+) -> tuple[float, float | None, float | None, int, int]:
+    """Return (wall_e2e, engine_ttft, engine_tpot, num_cached, output_tokens)."""
     t_start = time.perf_counter()
     resp = await client.generate_tokens(
         prompt_token_ids,
         max_tokens=max_tokens,
         temperature=temperature,
     )
-    wall_ttft = time.perf_counter() - t_start
+    wall_e2e = time.perf_counter() - t_start
 
     engine_ttft: float | None = None
+    engine_tpot: float | None = None
+    output_tokens = max_tokens
     metrics = resp.get("metrics")
     if isinstance(metrics, dict):
         raw = metrics.get("first_token_latency")
         if raw is not None:
             engine_ttft = float(raw)
+        engine_tpot = _extract_engine_tpot(metrics)
+        raw_output_tokens = metrics.get("num_generation_tokens")
+        if raw_output_tokens is not None:
+            output_tokens = int(raw_output_tokens)
 
     num_cached = resp.get("num_cached_tokens") or 0
 
-    return wall_ttft, engine_ttft, int(num_cached)
+    return wall_e2e, engine_ttft, engine_tpot, int(num_cached), int(output_tokens)
 
 
 async def run_profiling(
@@ -249,12 +282,17 @@ async def run_profiling(
     total = len(config.prompt_lengths) * len(config.prefix_ratios) * config.num_trials
     done = 0
 
+    async def _prime_cache(prompt_token_ids: list[int], prefix_ratio: float) -> None:
+        if prefix_ratio > 0 and len(prompt_token_ids) > 0:
+            await client.generate_tokens(
+                prompt_token_ids,
+                max_tokens=1,
+                temperature=0.0,
+            )
+
     for prompt_length in config.prompt_lengths:
         for prefix_ratio in config.prefix_ratios:
             for trial in range(config.num_trials):
-                # Reset prefix cache before each measurement.
-                await client.reset()
-
                 prime_tokens, measure_tokens = build_prompt_pair(
                     prompt_length,
                     prefix_ratio,
@@ -262,41 +300,57 @@ async def run_profiling(
                     trial,
                 )
 
-                # Prime the cache if there is a shared prefix.
-                if prefix_ratio > 0 and len(prime_tokens) > 0:
-                    await client.generate_tokens(
-                        prime_tokens,
-                        max_tokens=config.max_output_tokens,
-                        temperature=0.0,
-                    )
-
-                # Measure TTFT.
-                wall_ttft, engine_ttft, num_cached = await measure_ttft(
+                # Reset + prime for the TTFT measurement.
+                await client.reset()
+                await _prime_cache(prime_tokens, prefix_ratio)
+                wall_ttft, engine_ttft, _, num_cached, _ = await measure_generation(
                     client,
                     measure_tokens,
-                    max_tokens=config.max_output_tokens,
+                    max_tokens=1,
                 )
+
+                tpot: float | None = None
+                engine_tpot: float | None = None
+                output_tokens = 1
+
+                if config.max_output_tokens > 1:
+                    # Reset + prime again so TPOT runs under the same cache state.
+                    await client.reset()
+                    await _prime_cache(prime_tokens, prefix_ratio)
+                    wall_e2e, _, engine_tpot, _, output_tokens = (
+                        await measure_generation(
+                            client,
+                            measure_tokens,
+                            max_tokens=config.max_output_tokens,
+                        )
+                    )
+                    if output_tokens > 1:
+                        tpot = (wall_e2e - wall_ttft) / (output_tokens - 1)
 
                 results.append(
                     ProfilingResult(
                         prompt_tokens=prompt_length,
                         prefix_ratio=prefix_ratio,
                         trial=trial,
+                        output_tokens=output_tokens,
                         ttft=wall_ttft,
+                        tpot=tpot,
                         engine_ttft=engine_ttft,
+                        engine_tpot=engine_tpot,
                         num_cached_tokens=num_cached,
                     )
                 )
 
                 done += 1
                 logger.info(
-                    "[%d/%d] prompt=%d prefix=%.0f%% trial=%d ttft=%.4fs cached=%d",
+                    "[%d/%d] prompt=%d prefix=%.0f%% trial=%d ttft=%.4fs tpot=%s cached=%d",
                     done,
                     total,
                     prompt_length,
                     prefix_ratio * 100,
                     trial,
                     wall_ttft,
+                    f"{tpot:.4f}s" if tpot is not None else "n/a",
                     num_cached,
                 )
 
@@ -311,35 +365,47 @@ async def run_profiling(
 def save_results_csv(results: list[ProfilingResult], path: Path) -> None:
     """Write profiling results to a CSV file."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
-        writer.writeheader()
-        for r in results:
-            row = asdict(r)
-            # Replace None with empty string for CSV.
-            row = {k: ("" if v is None else v) for k, v in row.items()}
-            writer.writerow(row)
+
+    rows = [asdict(result) for result in results]
+    df = pd.DataFrame(rows, columns=CSV_COLUMNS)
+    df.to_csv(path, index=False)
+
     logger.info("Saved %d results to %s", len(results), path)
 
 
 def load_results_csv(path: Path) -> list[ProfilingResult]:
     """Load profiling results from a CSV file."""
+    df = pd.read_csv(path)
+
+    defaults: dict[str, Any] = {
+        "output_tokens": 1,
+        "tpot": pd.NA,
+        "engine_ttft": pd.NA,
+        "engine_tpot": pd.NA,
+    }
+    for column, default in defaults.items():
+        if column not in df.columns:
+            df[column] = default
+
     results: list[ProfilingResult] = []
-    with open(path, newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            results.append(
-                ProfilingResult(
-                    prompt_tokens=int(row["prompt_tokens"]),
-                    prefix_ratio=float(row["prefix_ratio"]),
-                    trial=int(row["trial"]),
-                    ttft=float(row["ttft"]),
-                    engine_ttft=(
-                        float(row["engine_ttft"]) if row["engine_ttft"] else None
-                    ),
-                    num_cached_tokens=int(row["num_cached_tokens"]),
-                )
+    for row in df.to_dict(orient="records"):
+        output_tokens = row.get("output_tokens", 1)
+        tpot = row.get("tpot")
+        engine_ttft = row.get("engine_ttft")
+        engine_tpot = row.get("engine_tpot")
+        results.append(
+            ProfilingResult(
+                prompt_tokens=int(row["prompt_tokens"]),
+                prefix_ratio=float(row["prefix_ratio"]),
+                trial=int(row["trial"]),
+                output_tokens=1 if pd.isna(output_tokens) else int(output_tokens),
+                ttft=float(row["ttft"]),
+                tpot=None if pd.isna(tpot) else float(tpot),
+                engine_ttft=None if pd.isna(engine_ttft) else float(engine_ttft),
+                engine_tpot=None if pd.isna(engine_tpot) else float(engine_tpot),
+                num_cached_tokens=int(row["num_cached_tokens"]),
             )
+        )
     return results
 
 
@@ -369,7 +435,7 @@ async def async_main(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="TTFT profiling for vLLM (via UDP server)",
+        description="TTFT/TPOT profiling for vLLM (via UDP server)",
     )
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -386,11 +452,16 @@ if __name__ == "__main__":
         help="Comma-separated list of prefix sharing ratios",
     )
     parser.add_argument("--num-trials", type=int, default=5)
-    parser.add_argument("--max-output-tokens", type=int, default=1)
+    parser.add_argument(
+        "--max-output-tokens",
+        type=int,
+        default=16,
+        help="Number of generated tokens for the TPOT measurement request",
+    )
     parser.add_argument(
         "--output-path",
         type=str,
-        default="results/profiling/ttft_traces.csv",
+        default="results/profiling/inference_traces.csv",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log-level", type=str, default="info")

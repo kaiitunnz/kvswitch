@@ -14,7 +14,7 @@ from kvswitch.vllm.profiling import (
     build_prompt_pair,
     generate_token_ids,
     load_results_csv,
-    measure_ttft,
+    measure_generation,
     run_profiling,
     save_results_csv,
     start_server_process,
@@ -36,7 +36,12 @@ def _make_mock_client(num_cached_tokens: int = 0) -> AsyncMock:
         return_value={
             "text": ["output"],
             "num_cached_tokens": num_cached_tokens,
-            "metrics": {"first_token_latency": 0.005},
+            "metrics": {
+                "first_token_latency": 0.005,
+                "num_generation_tokens": 4,
+                "first_token_ts": 10.0,
+                "last_token_ts": 10.006,
+            },
         }
     )
     return client
@@ -51,7 +56,7 @@ class TestProfilingConfig:
     def test_defaults(self) -> None:
         cfg = ProfilingConfig()
         assert cfg.num_trials == 5
-        assert cfg.max_output_tokens == 1
+        assert cfg.max_output_tokens == 16
         assert 128 in cfg.prompt_lengths
         assert 0.0 in cfg.prefix_ratios
 
@@ -132,21 +137,40 @@ class TestBuildPromptPair:
 
 
 # ---------------------------------------------------------------------------
-# measure_ttft (mocked client)
+# measure_generation (mocked client)
 # ---------------------------------------------------------------------------
 
 
-class TestMeasureTTFT:
-    def test_basic(self) -> None:
+class TestMeasureGeneration:
+    def test_extracts_ttft_and_tpot(self) -> None:
         client = _make_mock_client(num_cached_tokens=64)
 
-        async def _run() -> tuple[float, float | None, int]:
-            return await measure_ttft(client, [1, 2, 3])
+        async def _run() -> tuple[float, float | None, float | None, int, int]:
+            return await measure_generation(client, [1, 2, 3], max_tokens=4)
 
-        wall_ttft, engine_ttft, num_cached = asyncio.run(_run())
-        assert wall_ttft >= 0.0
+        wall_e2e, engine_ttft, engine_tpot, num_cached, output_tokens = asyncio.run(
+            _run()
+        )
+        assert wall_e2e >= 0.0
         assert engine_ttft == pytest.approx(0.005)
+        assert engine_tpot == pytest.approx(0.002)
         assert num_cached == 64
+        assert output_tokens == 4
+
+    def test_single_token_call_covers_ttft_case(self) -> None:
+        client = _make_mock_client(num_cached_tokens=64)
+
+        async def _run() -> tuple[float, float | None, float | None, int, int]:
+            return await measure_generation(client, [1, 2, 3], max_tokens=1)
+
+        wall_e2e, engine_ttft, engine_tpot, num_cached, output_tokens = asyncio.run(
+            _run()
+        )
+        assert wall_e2e >= 0.0
+        assert engine_ttft == pytest.approx(0.005)
+        assert engine_tpot == pytest.approx(0.002)
+        assert num_cached == 64
+        assert output_tokens == 4
         client.generate_tokens.assert_called_once()
 
     def test_no_metrics(self) -> None:
@@ -155,19 +179,23 @@ class TestMeasureTTFT:
             return_value={"text": ["out"], "num_cached_tokens": None}
         )
 
-        async def _run() -> tuple[float, float | None, int]:
-            return await measure_ttft(client, [1])
+        async def _run() -> tuple[float, float | None, float | None, int, int]:
+            return await measure_generation(client, [1], max_tokens=1)
 
-        wall_ttft, engine_ttft, num_cached = asyncio.run(_run())
-        assert wall_ttft >= 0.0
+        wall_e2e, engine_ttft, engine_tpot, num_cached, output_tokens = asyncio.run(
+            _run()
+        )
+        assert wall_e2e >= 0.0
         assert engine_ttft is None
+        assert engine_tpot is None
         assert num_cached == 0
+        assert output_tokens == 1
 
     def test_custom_params(self) -> None:
         client = _make_mock_client()
 
-        async def _run() -> tuple[float, float | None, int]:
-            return await measure_ttft(client, [1], max_tokens=5, temperature=0.5)
+        async def _run() -> tuple[float, float | None, float | None, int, int]:
+            return await measure_generation(client, [1], max_tokens=5, temperature=0.5)
 
         asyncio.run(_run())
         call_kwargs = client.generate_tokens.call_args
@@ -187,6 +215,7 @@ class TestRunProfiling:
             prompt_lengths=[64, 128],
             prefix_ratios=[0.0, 0.5],
             num_trials=2,
+            max_output_tokens=4,
         )
 
         results = asyncio.run(run_profiling(client, config))
@@ -197,18 +226,22 @@ class TestRunProfiling:
             assert r.prompt_tokens in [64, 128]
             assert r.prefix_ratio in [0.0, 0.5]
             assert 0 <= r.trial < 2
+            assert r.output_tokens == 4
             assert r.ttft >= 0.0
+            assert r.tpot is not None
+            assert r.engine_tpot == pytest.approx(0.002)
 
-    def test_reset_called_each_trial(self) -> None:
+    def test_reset_called_for_ttft_and_tpot(self) -> None:
         client = _make_mock_client()
         config = ProfilingConfig(
             prompt_lengths=[64],
             prefix_ratios=[0.0, 0.5],
             num_trials=2,
+            max_output_tokens=4,
         )
         asyncio.run(run_profiling(client, config))
-        # reset() should be called once per measurement (4 total).
-        assert client.reset.call_count == 4
+        # One reset for TTFT and one reset for TPOT per trial (4 trials total).
+        assert client.reset.call_count == 8
 
     def test_priming_called_for_nonzero_ratio(self) -> None:
         client = _make_mock_client()
@@ -216,12 +249,31 @@ class TestRunProfiling:
             prompt_lengths=[64],
             prefix_ratios=[0.0, 0.5],
             num_trials=1,
+            max_output_tokens=4,
         )
         asyncio.run(run_profiling(client, config))
-        # ratio=0.0: 1 generate_tokens (measure only)
-        # ratio=0.5: 2 generate_tokens (prime + measure)
-        # Total = 3
-        assert client.generate_tokens.call_count == 3
+        # ratio=0.0: TTFT + TPOT requests = 2 generate_tokens calls.
+        # ratio=0.5: TTFT + TPOT requests plus 2 priming requests = 4 calls.
+        # Total = 6.
+        assert client.generate_tokens.call_count == 6
+
+    def test_skips_tpot_when_single_output_token(self) -> None:
+        client = _make_mock_client()
+        config = ProfilingConfig(
+            prompt_lengths=[64],
+            prefix_ratios=[0.0],
+            num_trials=1,
+            max_output_tokens=1,
+        )
+
+        results = asyncio.run(run_profiling(client, config))
+
+        assert len(results) == 1
+        assert results[0].output_tokens == 1
+        assert results[0].tpot is None
+        assert results[0].engine_tpot is None
+        assert client.reset.call_count == 1
+        assert client.generate_tokens.call_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -304,16 +356,22 @@ class TestCSV:
                 prompt_tokens=256,
                 prefix_ratio=0.5,
                 trial=0,
+                output_tokens=4,
                 ttft=0.0123,
+                tpot=0.0015,
                 engine_ttft=0.0100,
+                engine_tpot=0.0012,
                 num_cached_tokens=128,
             ),
             ProfilingResult(
                 prompt_tokens=512,
                 prefix_ratio=0.0,
                 trial=1,
+                output_tokens=1,
                 ttft=0.0456,
+                tpot=None,
                 engine_ttft=None,
+                engine_tpot=None,
                 num_cached_tokens=0,
             ),
         ]
@@ -324,12 +382,32 @@ class TestCSV:
 
         assert loaded[0].prompt_tokens == 256
         assert loaded[0].prefix_ratio == pytest.approx(0.5)
+        assert loaded[0].output_tokens == 4
         assert loaded[0].ttft == pytest.approx(0.0123)
+        assert loaded[0].tpot == pytest.approx(0.0015)
         assert loaded[0].engine_ttft == pytest.approx(0.0100)
+        assert loaded[0].engine_tpot == pytest.approx(0.0012)
         assert loaded[0].num_cached_tokens == 128
 
+        assert loaded[1].output_tokens == 1
+        assert loaded[1].tpot is None
         assert loaded[1].engine_ttft is None
+        assert loaded[1].engine_tpot is None
         assert loaded[1].num_cached_tokens == 0
+
+    def test_load_old_schema_defaults_tpot_fields(self, tmp_path: Path) -> None:
+        path = tmp_path / "old_results.csv"
+        path.write_text(
+            "prompt_tokens,prefix_ratio,trial,ttft,engine_ttft,num_cached_tokens\n"
+            "256,0.5,0,0.0123,0.0100,128\n"
+        )
+
+        loaded = load_results_csv(path)
+
+        assert len(loaded) == 1
+        assert loaded[0].output_tokens == 1
+        assert loaded[0].tpot is None
+        assert loaded[0].engine_tpot is None
 
     def test_csv_columns(self, tmp_path: Path) -> None:
         path = tmp_path / "cols.csv"
