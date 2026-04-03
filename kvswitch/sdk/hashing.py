@@ -9,9 +9,14 @@ import hmac
 import struct
 from typing import Final
 
+from kvswitch.utils.prefix import (
+    ROOT_PARENT_HASH,
+    chunk_token_ids as _chunk_token_ids,
+    pack_token_ids,
+)
+
 CHUNK_SIZE: Final[int] = 256
 MAX_HEADER_HASHES: Final[int] = 4
-ROOT_PARENT_HASH: Final[bytes] = b"\x00" * 32
 
 
 def chunk_token_ids(
@@ -24,14 +29,11 @@ def chunk_token_ids(
     By default, only full cacheable chunks are returned so the resulting hash
     chain matches prefix-cache semantics.
     """
-    if chunk_size <= 0:
-        raise ValueError("chunk_size must be positive")
-
-    limit = len(token_ids)
-    if cacheable_only:
-        limit -= limit % chunk_size
-
-    return [token_ids[i : i + chunk_size] for i in range(0, limit, chunk_size)]
+    return _chunk_token_ids(
+        token_ids,
+        chunk_size=chunk_size,
+        cacheable_only=cacheable_only,
+    )
 
 
 def compute_hash_chain(
@@ -51,7 +53,7 @@ def compute_hash_chain(
         chunk_size=chunk_size,
         cacheable_only=True,
     ):
-        payload = parent + struct.pack(f"!{len(chunk)}I", *chunk)
+        payload = parent + pack_token_ids(chunk)
         parent = hmac.new(key, payload, hashlib.sha256).digest()
         hashes.append(parent)
         if len(hashes) >= max_hashes:

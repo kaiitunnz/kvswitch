@@ -7,13 +7,13 @@ Simulates the full SGLang-style routing pipeline:
 Each step is individually timed so we can quantify L7 overhead.
 """
 
-import hashlib
 import logging
-import struct
 import time
 from dataclasses import dataclass
 
 from vllm.tokenizers import get_tokenizer
+
+from kvswitch.utils.prefix import cumulative_sha256_chain
 
 logger = logging.getLogger(__name__)
 
@@ -67,27 +67,13 @@ class L7Router:
     # Hashing
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _sha256_block(parent_hash: bytes, token_ids: list[int]) -> bytes:
-        """Compute the hash of a single block (cumulative chain)."""
-        h = hashlib.sha256()
-        h.update(parent_hash)
-        h.update(struct.pack(f"!{len(token_ids)}I", *token_ids))
-        return h.digest()
-
     def hash_blocks(self, token_ids: list[int]) -> list[bytes]:
         """Compute cumulative SHA-256 block hashes for a token sequence.
 
         Mirrors vLLM's APC semantics: each block hash depends on the
         parent hash plus the current block's tokens.
         """
-        hashes: list[bytes] = []
-        parent = b"\x00" * 32
-        for i in range(0, len(token_ids) - self.block_size + 1, self.block_size):
-            block_tokens = token_ids[i : i + self.block_size]
-            parent = self._sha256_block(parent, block_tokens)
-            hashes.append(parent)
-        return hashes
+        return cumulative_sha256_chain(token_ids, self.block_size)
 
     # ------------------------------------------------------------------
     # Routing
