@@ -32,14 +32,14 @@ include = ["kvswitch*"]
 
 [tool.isort]
 profile = "black"
-skip = ["3rdparty", ".venv"]
+skip = ["3rdparty", ".venv", "tmp"]
 
 [tool.ruff]
 target-version = "py312"
-exclude = ["3rdparty", ".venv"]
+exclude = ["3rdparty", ".venv", "tmp"]
 
 [tool.black]
-force-exclude = "(3rdparty|\\.venv)"
+force-exclude = "(3rdparty|\\.venv|tmp)"
 
 [tool.mypy]
 explicit_package_bases = false
@@ -48,10 +48,10 @@ files = ["kvswitch"]
 
 [tool.codespell]
 ignore-words-list = ["assertIn"]
-skip = ["3rdparty", ".venv", "data", "results", "*.ipynb"]
+skip = ["3rdparty", ".venv", "data", "results", "*.ipynb", "tmp"]
 
 [tool.pyright]
-exclude = ["3rdparty", ".venv", "**/node_modules", "**/__pycache__", "**/.*"]
+exclude = ["3rdparty", ".venv", "tmp", "**/node_modules", "**/__pycache__", "**/.*"]
 extraPaths = ["3rdparty/vllm"]
 deprecateTypingAliases = true
 reportDeprecated = "warning"

@@ -101,7 +101,9 @@ if __name__ == "__main__":
     parser.add_argument("--n-workers", type=int, default=1)
     parser.add_argument("--with-router", action="store_true")
     parser.add_argument(
-        "--delay", type=str, default=None,
+        "--delay",
+        type=str,
+        default=None,
         help="Per-link latency, e.g. '1ms', '10ms'",
     )
     parser.add_argument("--log-level", type=str, default="INFO")
