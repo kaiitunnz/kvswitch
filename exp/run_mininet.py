@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 WORKER_PORT = 8000
 ROUTER_PORT = 9000
-DEFAULT_TRACES = Path("results/profiling/ttft_traces.csv")
+DEFAULT_TRACES = Path("results/profiling/inference_traces.csv")
 DEFAULT_OUTPUT = Path("results/mininet/comparison.json")
 
 PYTHON = sys.executable
