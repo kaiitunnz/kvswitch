@@ -4,17 +4,31 @@ version = "0.1.0"
 description = "KVSwitch"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
-dependencies = []
+dependencies = [
+    "mininet>=2.3.0.dev6",
+]
 
 [project.optional-dependencies]
 dev = [
     "black>=26.3.1",
     "codespell>=2.4.2",
+    "ipykernel>=7.2.0",
     "isort>=8.0.1",
+    "matplotlib>=3.10.8",
     "mypy>=1.19.1",
+    "numpy>=2.4.4",
+    "pandas>=3.0.1",
     "pytest>=9.0.2",
     "ruff>=0.15.8",
+    "seaborn>=0.13.2",
 ]
+
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["kvswitch*"]
 
 [tool.isort]
 profile = "black"
@@ -34,7 +48,7 @@ files = ["kvswitch"]
 
 [tool.codespell]
 ignore-words-list = ["assertIn"]
-skip = ["3rdparty", ".venv", "data", "results"]
+skip = ["3rdparty", ".venv", "data", "results", "*.ipynb"]
 
 [tool.pyright]
 exclude = ["3rdparty", ".venv", "**/node_modules", "**/__pycache__", "**/.*"]
