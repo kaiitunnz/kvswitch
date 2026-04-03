@@ -63,26 +63,51 @@ class UDPServerProtocol(asyncio.DatagramProtocol):
         logger.error("UDP protocol error: %s", exc)
 
 
-@dataclass
+@dataclass(init=False)
 class UDPServer:
     """Simple async UDP server."""
 
     host: str = "0.0.0.0"
-    port: int = 8000
     handler: RequestHandler | None = None
+    _port: int = field(default=8000, repr=False)
     _transport: asyncio.DatagramTransport | None = field(
         default=None, init=False, repr=False
     )
     _protocol: UDPServerProtocol | None = field(default=None, init=False, repr=False)
+
+    def __init__(
+        self,
+        host: str = "0.0.0.0",
+        port: int = 8000,
+        handler: RequestHandler | None = None,
+    ) -> None:
+        self.host = host
+        self.handler = handler
+        self._port = port
+        self._transport = None
+        self._protocol = None
+
+    @property
+    def port(self) -> int:
+        """Return the configured port before start, else the actual bound port."""
+        if self._transport is not None:
+            return self.bound_port()
+        return self._port
 
     async def start(self) -> None:
         assert self.handler is not None, "handler must be set before starting"
         loop = asyncio.get_running_loop()
         self._transport, self._protocol = await loop.create_datagram_endpoint(
             lambda: UDPServerProtocol(self.handler),  # type: ignore[arg-type]
-            local_addr=(self.host, self.port),
+            local_addr=(self.host, self._port),
         )
         logger.info("UDP server listening on %s:%d", self.host, self.port)
+
+    def bound_port(self) -> int:
+        """Return the actual bound UDP port."""
+        if self._transport is None:
+            raise RuntimeError("UDP server is not started")
+        return self._transport.get_extra_info("sockname")[1]
 
     def close(self) -> None:
         if self._transport is not None:

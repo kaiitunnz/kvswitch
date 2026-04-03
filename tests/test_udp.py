@@ -52,10 +52,8 @@ class TestUDPServerClient:
         async def _run() -> None:
             server = UDPServer(host="127.0.0.1", port=0, handler=_echo_handler)
             await server.start()
-            assert server._transport is not None
-            # Get the actual bound port.
-            addr = server._transport.get_extra_info("sockname")
-            port = addr[1]
+            port = server.bound_port()
+            assert server.port == port
 
             client = UDPClient(host="127.0.0.1", port=port, timeout=5.0)
             response = await client.send({"hello": "world"})
@@ -69,9 +67,7 @@ class TestUDPServerClient:
         async def _run() -> None:
             server = UDPServer(host="127.0.0.1", port=0, handler=_echo_handler)
             await server.start()
-            assert server._transport is not None
-            addr = server._transport.get_extra_info("sockname")
-            port = addr[1]
+            port = server.bound_port()
 
             for i in range(5):
                 client = UDPClient(host="127.0.0.1", port=port, timeout=5.0)
@@ -86,9 +82,7 @@ class TestUDPServerClient:
         async def _run() -> None:
             server = UDPServer(host="127.0.0.1", port=0, handler=_error_handler)
             await server.start()
-            assert server._transport is not None
-            addr = server._transport.get_extra_info("sockname")
-            port = addr[1]
+            port = server.bound_port()
 
             client = UDPClient(host="127.0.0.1", port=port, timeout=5.0)
             resp = await client.send({"test": 1})
@@ -111,9 +105,7 @@ class TestUDPServerClient:
         async def _run() -> None:
             server = UDPServer(host="127.0.0.1", port=0, handler=_echo_handler)
             await server.start()
-            assert server._transport is not None
-            addr = server._transport.get_extra_info("sockname")
-            port = addr[1]
+            port = server.bound_port()
 
             # Send raw invalid JSON via low-level socket.
             loop = asyncio.get_running_loop()
@@ -156,6 +148,15 @@ class TestUDPServerLifecycle:
         server = UDPServer(host="127.0.0.1", port=0, handler=_echo_handler)
         # Should not raise.
         server.close()
+
+    def test_port_property_returns_requested_port_before_start(self) -> None:
+        server = UDPServer(host="127.0.0.1", port=43210, handler=_echo_handler)
+        assert server.port == 43210
+
+    def test_bound_port_requires_start(self) -> None:
+        server = UDPServer(host="127.0.0.1", port=0, handler=_echo_handler)
+        with pytest.raises(RuntimeError, match="not started"):
+            server.bound_port()
 
     def test_start_requires_handler(self) -> None:
         async def _run() -> None:
