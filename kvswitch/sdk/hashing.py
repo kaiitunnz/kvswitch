@@ -11,7 +11,9 @@ from typing import Final
 
 from kvswitch.utils.prefix import (
     ROOT_PARENT_HASH,
-    chunk_token_ids as _chunk_token_ids,
+)
+from kvswitch.utils.prefix import chunk_token_ids as _chunk_token_ids
+from kvswitch.utils.prefix import (
     pack_token_ids,
 )
 
