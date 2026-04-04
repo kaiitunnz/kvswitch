@@ -1,0 +1,225 @@
+"""Workload generator for KVSwitch evaluation.
+
+Loads ShareGPT conversations, injects shared system prompts at a
+configurable ratio, tokenizes with the model's tokenizer, and
+generates Poisson-distributed arrival times.
+
+The generated workload is serialized to JSON so it can be passed to
+the Mininet ``workload_client`` CLI tool running inside a host
+namespace.
+"""
+
+import json
+import logging
+import random
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class WorkloadRequest:
+    """A single request in the evaluation workload."""
+
+    request_id: int
+    prompt_token_ids: list[int]
+    scheduled_time: float  # seconds from experiment start
+    prefix_group: str  # "group_0" … "group_N" or "none"
+    max_tokens: int
+
+
+@dataclass
+class WorkloadConfig:
+    """Parameters for workload generation."""
+
+    dataset_path: Path = Path("data/ShareGPT_V3_unfiltered_cleaned_split.json")
+    num_requests: int = 200
+    request_rate: float = 10.0  # lambda for Poisson (requests/sec)
+    prefix_sharing_ratio: float = 0.5  # fraction assigned to a prefix group
+    num_prefix_groups: int = 3
+    system_prompt_tokens: int = 256  # tokens per injected system prompt
+    max_prompt_tokens: int = 2048
+    max_output_tokens: int = 16
+    seed: int = 42
+    model: str = "meta-llama/Llama-3.2-3B-Instruct"
+
+
+# ---------------------------------------------------------------------------
+# ShareGPT loading
+# ---------------------------------------------------------------------------
+
+
+def load_sharegpt_prompts(path: Path, max_items: int | None = None) -> list[str]:
+    """Extract the first human turn from each ShareGPT conversation.
+
+    Returns a list of prompt strings (not yet tokenized).
+    """
+    with open(path) as f:
+        data = json.load(f)
+
+    prompts: list[str] = []
+    for item in data:
+        conversations = item.get("conversations", [])
+        for turn in conversations:
+            if turn.get("from") == "human":
+                text = turn.get("value", "").strip()
+                if text:
+                    prompts.append(text)
+                break  # only first human turn
+        if max_items is not None and len(prompts) >= max_items:
+            break
+
+    return prompts
+
+
+# ---------------------------------------------------------------------------
+# System prompt generation
+# ---------------------------------------------------------------------------
+
+
+def generate_system_prompts(
+    num_groups: int,
+    tokens_per_group: int,
+    seed: int,
+    token_id_min: int = 100,
+    token_id_max: int = 10000,
+) -> dict[str, list[int]]:
+    """Generate deterministic system prompt token sequences per group."""
+    rng = random.Random(seed)
+    prompts: dict[str, list[int]] = {}
+    for i in range(num_groups):
+        key = f"group_{i}"
+        prompts[key] = [
+            rng.randint(token_id_min, token_id_max) for _ in range(tokens_per_group)
+        ]
+    return prompts
+
+
+# ---------------------------------------------------------------------------
+# Workload generation
+# ---------------------------------------------------------------------------
+
+
+class WorkloadGenerator:
+    """Generates a reproducible evaluation workload from ShareGPT data."""
+
+    def __init__(self, config: WorkloadConfig) -> None:
+        self.config = config
+        self._tokenizer: Any = None
+
+    def _get_tokenizer(self) -> Any:
+        if self._tokenizer is None:
+            from vllm.tokenizers import get_tokenizer
+
+            self._tokenizer = get_tokenizer(self.config.model)
+        return self._tokenizer
+
+    def generate(self) -> list[WorkloadRequest]:
+        """Generate the full workload: tokenize, inject prefixes, schedule."""
+        cfg = self.config
+        rng = random.Random(cfg.seed)
+
+        # Load and tokenize ShareGPT prompts.
+        raw_prompts = load_sharegpt_prompts(
+            cfg.dataset_path, max_items=cfg.num_requests * 2
+        )
+        if not raw_prompts:
+            raise ValueError(f"No prompts loaded from {cfg.dataset_path}")
+        logger.info("Loaded %d raw prompts from ShareGPT", len(raw_prompts))
+
+        tokenizer = self._get_tokenizer()
+        tokenized: list[list[int]] = []
+        for text in raw_prompts:
+            ids = tokenizer.encode(text)
+            if len(ids) > 0:
+                tokenized.append(ids[: cfg.max_prompt_tokens])
+            if len(tokenized) >= cfg.num_requests:
+                break
+
+        if len(tokenized) < cfg.num_requests:
+            logger.warning(
+                "Only %d usable prompts (requested %d); recycling",
+                len(tokenized),
+                cfg.num_requests,
+            )
+            while len(tokenized) < cfg.num_requests:
+                tokenized.append(tokenized[rng.randint(0, len(tokenized) - 1)])
+
+        # Generate system prompts for prefix groups.
+        system_prompts = generate_system_prompts(
+            cfg.num_prefix_groups, cfg.system_prompt_tokens, cfg.seed
+        )
+
+        # Assign prefix groups and build final token sequences.
+        group_keys = list(system_prompts.keys())
+        requests: list[WorkloadRequest] = []
+        t = 0.0
+
+        for i in range(cfg.num_requests):
+            user_tokens = tokenized[i]
+
+            # Assign to a prefix group with probability prefix_sharing_ratio.
+            if rng.random() < cfg.prefix_sharing_ratio:
+                group = rng.choice(group_keys)
+                prompt_ids = system_prompts[group] + user_tokens
+            else:
+                group = "none"
+                prompt_ids = user_tokens
+
+            # Truncate to max_prompt_tokens.
+            prompt_ids = prompt_ids[: cfg.max_prompt_tokens]
+
+            # Poisson inter-arrival time.
+            if cfg.request_rate > 0:
+                t += rng.expovariate(cfg.request_rate)
+            else:
+                t += 0.0  # All at once.
+
+            requests.append(
+                WorkloadRequest(
+                    request_id=i,
+                    prompt_token_ids=prompt_ids,
+                    scheduled_time=t,
+                    prefix_group=group,
+                    max_tokens=cfg.max_output_tokens,
+                )
+            )
+
+        logger.info(
+            "Generated %d requests (rate=%.1f/s, prefix_sharing=%.0f%%, groups=%d)",
+            len(requests),
+            cfg.request_rate,
+            cfg.prefix_sharing_ratio * 100,
+            cfg.num_prefix_groups,
+        )
+        return requests
+
+
+# ---------------------------------------------------------------------------
+# Serialization (for passing to Mininet host CLI)
+# ---------------------------------------------------------------------------
+
+
+def save_workload(requests: list[WorkloadRequest], path: Path) -> None:
+    """Write workload to a JSON file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = [asdict(r) for r in requests]
+    path.write_text(json.dumps(data))
+    logger.info("Saved %d requests to %s", len(requests), path)
+
+
+def load_workload(path: Path) -> list[WorkloadRequest]:
+    """Read workload from a JSON file."""
+    data = json.loads(path.read_text())
+    return [
+        WorkloadRequest(
+            request_id=r["request_id"],
+            prompt_token_ids=r["prompt_token_ids"],
+            scheduled_time=r["scheduled_time"],
+            prefix_group=r["prefix_group"],
+            max_tokens=r["max_tokens"],
+        )
+        for r in data
+    ]
