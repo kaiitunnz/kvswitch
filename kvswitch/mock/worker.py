@@ -77,6 +77,8 @@ class MockWorker:
         self._capacity_cond = asyncio.Condition()
         self._active: int = 0
         self._active_batched_tokens: int = 0
+        self._queued_requests: int = 0
+        self._queued_batched_tokens: int = 0
         self._local_block_cache: OrderedDict[bytes, None] = OrderedDict()
         self._export_prefix_cache: OrderedDict[tuple[int, ...], None] = OrderedDict()
         self._server = UDPServer(host=host, port=port, handler=self._handle)
@@ -137,7 +139,11 @@ class MockWorker:
         self,
         event_type: str,
         prefix_hashes: tuple[int, ...] = (),
-        queue_depth: int | None = None,
+        load: int | None = None,
+        active_requests: int | None = None,
+        active_batched_tokens: int | None = None,
+        queued_requests: int | None = None,
+        queued_batched_tokens: int | None = None,
     ) -> None:
         """Fire-and-forget a cache event to the SDN controller."""
         if self.controller_host is None or self.controller_port is None:
@@ -149,8 +155,16 @@ class MockWorker:
         }
         if prefix_hashes:
             payload["prefix_hashes"] = list(prefix_hashes)
-        if queue_depth is not None:
-            payload["queue_depth"] = queue_depth
+        if load is not None:
+            payload["load"] = load
+        if active_requests is not None:
+            payload["active_requests"] = active_requests
+        if active_batched_tokens is not None:
+            payload["active_batched_tokens"] = active_batched_tokens
+        if queued_requests is not None:
+            payload["queued_requests"] = queued_requests
+        if queued_batched_tokens is not None:
+            payload["queued_batched_tokens"] = queued_batched_tokens
 
         asyncio.ensure_future(self._send_event(payload))
 
@@ -170,29 +184,60 @@ class MockWorker:
                 exc_info=True,
             )
 
-    def _refresh_queue_depth(self) -> None:
-        self._emit_event("queue_update", queue_depth=self._active)
+    def _load_metric(self) -> int:
+        return self._active_batched_tokens + self._queued_batched_tokens
+
+    def _emit_load_update(self) -> None:
+        self._emit_event(
+            "queue_update",
+            load=self._load_metric(),
+            active_requests=self._active,
+            active_batched_tokens=self._active_batched_tokens,
+            queued_requests=self._queued_requests,
+            queued_batched_tokens=self._queued_batched_tokens,
+        )
 
     async def _acquire_capacity(self, batched_tokens: int) -> bool:
-        async with self._capacity_cond:
-            if (
-                self.max_num_batched_tokens is not None
-                and batched_tokens > self.max_num_batched_tokens
-            ):
-                return False
+        queued = False
+        acquired = False
+        try:
+            async with self._capacity_cond:
+                if (
+                    self.max_num_batched_tokens is not None
+                    and batched_tokens > self.max_num_batched_tokens
+                ):
+                    return False
 
-            while self._active >= self.max_num_seqs or (
-                self.max_num_batched_tokens is not None
-                and self._active_batched_tokens + batched_tokens
-                > self.max_num_batched_tokens
-            ):
-                await self._capacity_cond.wait()
+                while self._active >= self.max_num_seqs or (
+                    self.max_num_batched_tokens is not None
+                    and (
+                        self._active_batched_tokens + batched_tokens
+                        > self.max_num_batched_tokens
+                    )
+                ):
+                    if not queued:
+                        self._queued_requests += 1
+                        self._queued_batched_tokens += batched_tokens
+                        queued = True
+                        self._emit_load_update()
+                    await self._capacity_cond.wait()
 
-            self._active += 1
-            self._active_batched_tokens += batched_tokens
+                if queued:
+                    self._queued_requests -= 1
+                    self._queued_batched_tokens -= batched_tokens
+                self._active += 1
+                self._active_batched_tokens += batched_tokens
+                acquired = True
 
-        self._refresh_queue_depth()
-        return True
+            self._emit_load_update()
+            return True
+        except Exception:
+            if queued and not acquired:
+                async with self._capacity_cond:
+                    self._queued_requests -= 1
+                    self._queued_batched_tokens -= batched_tokens
+                self._emit_load_update()
+            raise
 
     async def _release_capacity(self, batched_tokens: int) -> None:
         async with self._capacity_cond:
@@ -200,7 +245,7 @@ class MockWorker:
             self._active_batched_tokens -= batched_tokens
             self._capacity_cond.notify_all()
 
-        self._refresh_queue_depth()
+        self._emit_load_update()
 
     def _update_local_cache(self, block_hashes: list[bytes]) -> None:
         for block_hash in block_hashes:
@@ -235,6 +280,9 @@ class MockWorker:
                     "worker_id": self.worker_id,
                     "active": self._active,
                     "active_batched_tokens": self._active_batched_tokens,
+                    "queued_requests": self._queued_requests,
+                    "queued_batched_tokens": self._queued_batched_tokens,
+                    "load": self._load_metric(),
                     "cached_prefixes": len(self._local_block_cache),
                     "exported_prefixes": len(self._export_prefix_cache),
                 }
@@ -326,7 +374,7 @@ class MockWorker:
                 self.kvswitch_port,
             )
 
-        self._refresh_queue_depth()
+        self._emit_load_update()
         if self._base_ttft_s is not None and self._per_token_ttft_s is not None:
             ttft_desc = f"base_ttft={self._base_ttft_s*1000:.1f}ms + {self._per_token_ttft_s*1000:.5f}ms/token"
         else:

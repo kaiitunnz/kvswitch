@@ -14,6 +14,7 @@ from kvswitch.controller.sdn_controller import WorkerPlacement
 from kvswitch.mock.worker import MockWorker
 from kvswitch.sdk.client import KVSwitchUDPClient
 from kvswitch.sdk.hashing import compute_truncated_hashes
+from kvswitch.utils.udp import UDPClient
 
 
 def test_tcam_manager_admits_and_evicts_lru_prefix() -> None:
@@ -94,10 +95,10 @@ def test_controller_installs_reroutes_and_deletes_leaf_rules_on_correct_switch()
     assert controller.leaf_tcam.installed_rule(prefix).target_id == "worker0"
 
     controller.handle_event(
-        CacheSyncEvent("queue_update", "worker0", queue_depth=8, timestamp=2.5)
+        CacheSyncEvent("queue_update", "worker0", load=8, timestamp=2.5)
     )
     controller.handle_event(
-        CacheSyncEvent("queue_update", "worker1", queue_depth=0, timestamp=2.5)
+        CacheSyncEvent("queue_update", "worker1", load=0, timestamp=2.5)
     )
     reroute_ops = controller.handle_event(
         CacheSyncEvent("alloc", "worker1", prefix_hashes=prefix, timestamp=3.0)
@@ -154,6 +155,87 @@ def test_controller_installs_reroutes_and_deletes_leaf_rules_on_correct_switch()
     assert controller.spine_tcam.installed_rule((0x1,)).target_id == "worker0"
 
 
+def test_controller_prefers_lower_token_load_over_lower_active_request_count() -> None:
+    adapter = InMemorySwitchAdapter()
+    controller = SDNController(
+        workers=[
+            WorkerPlacement(
+                worker_id="worker0",
+                leaf_switch="leaf0",
+                worker_ip="10.0.0.1",
+                worker_mac="02:00:00:00:00:01",
+                spine_port=10,
+                leaf_port=1,
+            ),
+            WorkerPlacement(
+                worker_id="worker1",
+                leaf_switch="leaf1",
+                worker_ip="10.0.1.1",
+                worker_mac="02:00:00:00:00:02",
+                spine_port=11,
+                leaf_port=2,
+            ),
+        ],
+        admission_threshold=1,
+        adapter=adapter,
+        spine_switch="s1",
+    )
+
+    controller.handle_event(
+        CacheSyncEvent(
+            "queue_update",
+            "worker0",
+            load=12,
+            active_requests=1,
+            active_batched_tokens=12,
+            timestamp=1.0,
+        )
+    )
+    controller.handle_event(
+        CacheSyncEvent(
+            "queue_update",
+            "worker1",
+            load=1,
+            active_requests=10,
+            active_batched_tokens=1,
+            timestamp=1.0,
+        )
+    )
+
+    prefix = (0x1, 0x2, 0x3)
+    controller.handle_event(
+        CacheSyncEvent("alloc", "worker0", prefix_hashes=prefix, timestamp=2.0)
+    )
+    reroute_ops = controller.handle_event(
+        CacheSyncEvent("alloc", "worker1", prefix_hashes=prefix, timestamp=3.0)
+    )
+
+    assert controller.spine_tcam.installed_rule((0x1,)).target_id == "worker1"
+    assert controller.leaf_tcam.installed_rule(prefix).target_id == "worker1"
+    assert any(
+        isinstance(op, TableAddOp)
+        and op.table == "leaf_prefix_route"
+        and op.action_params["port"] == 2
+        for op in reroute_ops
+    )
+
+    snapshot = controller.snapshot()
+    assert snapshot["worker_loads"]["worker0"] == {
+        "active_requests": 1,
+        "active_batched_tokens": 12,
+        "queued_requests": 0,
+        "queued_batched_tokens": 0,
+        "load": 12,
+    }
+    assert snapshot["worker_loads"]["worker1"] == {
+        "active_requests": 10,
+        "active_batched_tokens": 1,
+        "queued_requests": 0,
+        "queued_batched_tokens": 0,
+        "load": 1,
+    }
+
+
 async def _wait_until(predicate, timeout: float = 1.0) -> None:
     deadline = time.perf_counter() + timeout
     while time.perf_counter() < deadline:
@@ -161,6 +243,89 @@ async def _wait_until(predicate, timeout: float = 1.0) -> None:
             return
         await asyncio.sleep(0.01)
     raise AssertionError("condition not reached before timeout")
+
+
+def test_mock_worker_emits_queue_backlog_metrics_to_controller() -> None:
+    async def _run() -> None:
+        adapter = InMemorySwitchAdapter()
+        controller = SDNController(
+            workers=[
+                WorkerPlacement(
+                    worker_id="worker0",
+                    leaf_switch="leaf0",
+                    worker_ip="10.0.0.1",
+                    worker_mac="02:00:00:00:00:01",
+                    spine_port=10,
+                    leaf_port=1,
+                )
+            ],
+            host="127.0.0.1",
+            port=0,
+            admission_threshold=1,
+            adapter=adapter,
+        )
+        await controller.start()
+
+        worker = MockWorker(
+            host="127.0.0.1",
+            port=0,
+            ttft_ms=80.0,
+            tpot_ms=10.0,
+            max_num_seqs=1,
+            max_num_batched_tokens=10,
+            worker_id="worker0",
+            controller_host="127.0.0.1",
+            controller_port=controller.port,
+        )
+        await worker.start()
+        port = worker.port
+
+        first_client = UDPClient(host="127.0.0.1", port=port, timeout=5.0)
+        second_client = UDPClient(host="127.0.0.1", port=port, timeout=5.0)
+        first_task = asyncio.create_task(
+            first_client.send(
+                {
+                    "endpoint": "generate",
+                    "prompt_token_ids": [1, 2, 3],
+                    "max_tokens": 2,
+                }
+            )
+        )
+        await asyncio.sleep(0.02)
+        second_task = asyncio.create_task(
+            second_client.send(
+                {
+                    "endpoint": "generate",
+                    "prompt_token_ids": [4, 5, 6],
+                    "max_tokens": 2,
+                }
+            )
+        )
+
+        await _wait_until(
+            lambda: controller.snapshot()["worker_loads"]["worker0"]["queued_requests"]
+            == 1,
+            timeout=2.0,
+        )
+        snapshot = controller.snapshot()
+        assert snapshot["worker_loads"]["worker0"] == {
+            "active_requests": 1,
+            "active_batched_tokens": 5,
+            "queued_requests": 1,
+            "queued_batched_tokens": 5,
+            "load": 10,
+        }
+
+        await asyncio.gather(first_task, second_task)
+        await _wait_until(
+            lambda: controller.snapshot()["worker_loads"]["worker0"]["load"] == 0,
+            timeout=2.0,
+        )
+
+        worker.close()
+        controller.close()
+
+    asyncio.run(_run())
 
 
 def test_mock_worker_emits_cache_events_and_controller_tracks_prefixes() -> None:

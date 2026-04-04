@@ -10,7 +10,7 @@ import asyncio
 import logging
 import time
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
 from kvswitch.controller.switch_adapter import (
@@ -85,7 +85,11 @@ class CacheSyncEvent:
     event_type: EventType
     worker_id: str
     prefix_hashes: tuple[int, ...] = ()
-    queue_depth: int | None = None
+    load: int | None = None
+    active_requests: int | None = None
+    active_batched_tokens: int | None = None
+    queued_requests: int | None = None
+    queued_batched_tokens: int | None = None
     timestamp: float | None = None
 
     def to_payload(self) -> dict[str, Any]:
@@ -96,8 +100,16 @@ class CacheSyncEvent:
         }
         if self.prefix_hashes:
             payload["prefix_hashes"] = normalize_prefix_hashes(self.prefix_hashes)
-        if self.queue_depth is not None:
-            payload["queue_depth"] = self.queue_depth
+        if self.load is not None:
+            payload["load"] = self.load
+        if self.active_requests is not None:
+            payload["active_requests"] = self.active_requests
+        if self.active_batched_tokens is not None:
+            payload["active_batched_tokens"] = self.active_batched_tokens
+        if self.queued_requests is not None:
+            payload["queued_requests"] = self.queued_requests
+        if self.queued_batched_tokens is not None:
+            payload["queued_batched_tokens"] = self.queued_batched_tokens
         if self.timestamp is not None:
             payload["timestamp"] = self.timestamp
         return payload
@@ -105,15 +117,44 @@ class CacheSyncEvent:
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "CacheSyncEvent":
         prefix_hashes = tuple(normalize_prefix_hashes(payload.get("prefix_hashes", [])))
-        raw_queue_depth = payload.get("queue_depth")
+        raw_load = payload.get("load")
+        raw_active_requests = payload.get("active_requests")
+        raw_active_batched_tokens = payload.get("active_batched_tokens")
+        raw_queued_requests = payload.get("queued_requests")
+        raw_queued_batched_tokens = payload.get("queued_batched_tokens")
         raw_timestamp = payload.get("timestamp")
         return cls(
             event_type=str(payload.get("event_type", "alloc")),  # type: ignore
             worker_id=str(payload["worker_id"]),
             prefix_hashes=prefix_hashes,
-            queue_depth=(int(raw_queue_depth) if raw_queue_depth is not None else None),
+            load=(int(raw_load) if raw_load is not None else None),
+            active_requests=(
+                int(raw_active_requests) if raw_active_requests is not None else None
+            ),
+            active_batched_tokens=(
+                int(raw_active_batched_tokens)
+                if raw_active_batched_tokens is not None
+                else None
+            ),
+            queued_requests=(
+                int(raw_queued_requests) if raw_queued_requests is not None else None
+            ),
+            queued_batched_tokens=(
+                int(raw_queued_batched_tokens)
+                if raw_queued_batched_tokens is not None
+                else None
+            ),
             timestamp=(float(raw_timestamp) if raw_timestamp is not None else None),
         )
+
+
+@dataclass(slots=True)
+class WorkerLoadState:
+    active_requests: int = 0
+    active_batched_tokens: int = 0
+    queued_requests: int = 0
+    queued_batched_tokens: int = 0
+    load: int = 0
 
 
 class SDNController:
@@ -152,7 +193,9 @@ class SDNController:
         )
 
         # Keep the observed cache holders separate from the currently installed rules.
-        self.queue_depths: dict[str, int] = {worker.worker_id: 0 for worker in workers}
+        self.worker_loads: dict[str, WorkerLoadState] = {
+            worker.worker_id: WorkerLoadState() for worker in workers
+        }
         self._spine_locations: dict[tuple[int, ...], set[str]] = defaultdict(set)
         self._leaf_locations: dict[PrefixKey, set[str]] = defaultdict(set)
 
@@ -170,7 +213,10 @@ class SDNController:
 
     def snapshot(self) -> dict[str, Any]:
         return {
-            "queue_depths": dict(self.queue_depths),
+            "worker_loads": {
+                worker_id: asdict(state)
+                for worker_id, state in self.worker_loads.items()
+            },
             "spine_rules": self.spine_tcam.snapshot(),
             "leaf_rules": self.leaf_tcam.snapshot(),
             "spine_locations": {
@@ -202,8 +248,16 @@ class SDNController:
         details = [f"type={event.event_type}", f"worker={event.worker_id}"]
         if event.prefix_hashes:
             details.append(f"prefix={format_prefix_key(event.prefix_hashes)}")
-        if event.queue_depth is not None:
-            details.append(f"queue_depth={event.queue_depth}")
+        if event.load is not None:
+            details.append(f"load={event.load}")
+        if event.active_requests is not None:
+            details.append(f"active_requests={event.active_requests}")
+        if event.active_batched_tokens is not None:
+            details.append(f"active_batched_tokens={event.active_batched_tokens}")
+        if event.queued_requests is not None:
+            details.append(f"queued_requests={event.queued_requests}")
+        if event.queued_batched_tokens is not None:
+            details.append(f"queued_batched_tokens={event.queued_batched_tokens}")
         return ", ".join(details)
 
     def handle_event(self, event: CacheSyncEvent) -> list[SwitchOp]:
@@ -213,14 +267,24 @@ class SDNController:
 
         ops: list[SwitchOp] = []
         if event.event_type == "queue_update":
-            if event.queue_depth is None:
-                raise ValueError("queue_update requires queue_depth")
-            self.queue_depths[event.worker_id] = event.queue_depth
-            # Queue updates can change both installed rule targets and ECMP weights.
+            if event.load is None:
+                raise ValueError("queue_update requires load")
+            self.worker_loads[event.worker_id] = WorkerLoadState(
+                active_requests=event.active_requests or 0,
+                active_batched_tokens=event.active_batched_tokens or 0,
+                queued_requests=event.queued_requests or 0,
+                queued_batched_tokens=event.queued_batched_tokens or 0,
+                load=event.load,
+            )
+            # Load updates can change both installed rule targets and ECMP weights.
             logger.info(
-                "Updated queue depth for %s to %d",
+                "Updated worker load for %s to load=%d active_requests=%d queued_requests=%d active_batched_tokens=%d queued_batched_tokens=%d",
                 event.worker_id,
-                event.queue_depth,
+                event.load,
+                event.active_requests or 0,
+                event.queued_requests or 0,
+                event.active_batched_tokens or 0,
+                event.queued_batched_tokens or 0,
             )
             ops.extend(self._reconcile_all_rules(now))
             ops.extend(self._refresh_ecmp_weights())
@@ -251,7 +315,7 @@ class SDNController:
         raise ValueError(f"unsupported event type: {event.event_type}")
 
     def _worker_score(self, worker_id: str) -> float:
-        return self.alpha - self.beta * float(self.queue_depths.get(worker_id, 0))
+        return self.alpha - self.beta * float(self.worker_loads[worker_id].load)
 
     def _select_worker(self, candidates: set[str]) -> str:
         if not candidates:
@@ -489,7 +553,7 @@ class SDNController:
         return ops
 
     def _inverse_queue_weight(self, worker_id: str) -> float:
-        return 1.0 / (1.0 + float(self.queue_depths.get(worker_id, 0)))
+        return 1.0 / (1.0 + float(self.worker_loads[worker_id].load))
 
     def _allocate_buckets(self, weights: dict[str, float]) -> dict[int, str]:
         if not weights:

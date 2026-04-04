@@ -36,6 +36,10 @@ class TestMockWorkerEndpoints:
             resp = await client.send({"endpoint": "health"})
             assert resp["status"] == "ok"
             assert resp["active"] == 0
+            assert resp["active_batched_tokens"] == 0
+            assert resp["queued_requests"] == 0
+            assert resp["queued_batched_tokens"] == 0
+            assert resp["load"] == 0
             assert resp["cached_prefixes"] == 0
             assert resp["exported_prefixes"] == 0
 
@@ -413,20 +417,21 @@ class TestBatchCapacity:
 
         asyncio.run(_run())
 
-    def test_health_reports_active_batched_tokens(self) -> None:
+    def test_health_reports_active_and_queued_load_metrics(self) -> None:
         async def _run() -> None:
             worker = MockWorker(
                 host="127.0.0.1",
                 port=0,
                 ttft_ms=80.0,
                 tpot_ms=10.0,
+                max_num_seqs=1,
                 max_num_batched_tokens=10,
             )
             await worker.start()
             port = _get_port(worker)
 
             client = UDPClient(host="127.0.0.1", port=port, timeout=5.0)
-            gen_task = asyncio.create_task(
+            first_task = asyncio.create_task(
                 client.send(
                     {
                         "endpoint": "generate",
@@ -437,12 +442,35 @@ class TestBatchCapacity:
             )
             await asyncio.sleep(0.02)
 
-            health_client = UDPClient(host="127.0.0.1", port=port, timeout=5.0)
-            resp = await health_client.send({"endpoint": "health"})
-            assert resp["active"] >= 1
-            assert resp["active_batched_tokens"] >= 5
+            second_client = UDPClient(host="127.0.0.1", port=port, timeout=5.0)
+            second_task = asyncio.create_task(
+                second_client.send(
+                    {
+                        "endpoint": "generate",
+                        "prompt_token_ids": [4, 5, 6],
+                        "max_tokens": 2,
+                    }
+                )
+            )
 
-            await gen_task
+            async def _health() -> dict:
+                health_client = UDPClient(host="127.0.0.1", port=port, timeout=5.0)
+                return await health_client.send({"endpoint": "health"})
+
+            health = None
+            for _ in range(40):
+                health = await _health()
+                if health["queued_requests"] == 1:
+                    break
+                await asyncio.sleep(0.01)
+            assert health is not None
+            assert health["active"] == 1
+            assert health["active_batched_tokens"] == 5
+            assert health["queued_requests"] == 1
+            assert health["queued_batched_tokens"] == 5
+            assert health["load"] == 10
+
+            await asyncio.gather(first_task, second_task)
             worker.close()
 
         asyncio.run(_run())
