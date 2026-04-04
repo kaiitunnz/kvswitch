@@ -112,12 +112,13 @@ class MockWorker:
             matched += 1
         return matched
 
-    async def _emit_event(
+    def _emit_event(
         self,
         event_type: str,
         prefix_hashes: tuple[int, ...] = (),
         queue_depth: int | None = None,
     ) -> None:
+        """Fire-and-forget a cache event to the SDN controller."""
         if self.controller_host is None or self.controller_port is None:
             return
         payload: dict[str, Any] = {
@@ -130,9 +131,12 @@ class MockWorker:
         if queue_depth is not None:
             payload["queue_depth"] = queue_depth
 
+        asyncio.ensure_future(self._send_event(payload))
+
+    async def _send_event(self, payload: dict[str, Any]) -> None:
         client = UDPClient(
-            host=self.controller_host,
-            port=self.controller_port,
+            host=self.controller_host,  # type: ignore[arg-type]
+            port=self.controller_port,  # type: ignore[arg-type]
             timeout=2.0,
         )
         try:
@@ -140,13 +144,13 @@ class MockWorker:
         except Exception:
             logger.warning(
                 "Failed to emit %s event from worker %s",
-                event_type,
+                payload.get("event_type"),
                 self.worker_id,
                 exc_info=True,
             )
 
-    async def _refresh_queue_depth(self) -> None:
-        await self._emit_event("queue_update", queue_depth=self._active)
+    def _refresh_queue_depth(self) -> None:
+        self._emit_event("queue_update", queue_depth=self._active)
 
     async def _acquire_capacity(self, batched_tokens: int) -> bool:
         async with self._capacity_cond:
@@ -166,7 +170,7 @@ class MockWorker:
             self._active += 1
             self._active_batched_tokens += batched_tokens
 
-        await self._refresh_queue_depth()
+        self._refresh_queue_depth()
         return True
 
     async def _release_capacity(self, batched_tokens: int) -> None:
@@ -175,7 +179,7 @@ class MockWorker:
             self._active_batched_tokens -= batched_tokens
             self._capacity_cond.notify_all()
 
-        await self._refresh_queue_depth()
+        self._refresh_queue_depth()
 
     def _update_local_cache(self, block_hashes: list[bytes]) -> None:
         for block_hash in block_hashes:
@@ -184,21 +188,21 @@ class MockWorker:
                 continue
             self._local_block_cache[block_hash] = None
 
-    async def _update_export_prefix_cache(self, prefix_hashes: list[int]) -> None:
+    def _update_export_prefix_cache(self, prefix_hashes: list[int]) -> None:
         for prefix in prefix_chain(prefix_hashes):
             if prefix in self._export_prefix_cache:
                 self._export_prefix_cache.move_to_end(prefix)
                 continue
 
             self._export_prefix_cache[prefix] = None
-            await self._emit_event("alloc", prefix_hashes=prefix)
+            self._emit_event("alloc", prefix_hashes=prefix)
 
             while (
                 self.max_cached_prefixes is not None
                 and len(self._export_prefix_cache) > self.max_cached_prefixes
             ):
                 evicted_prefix, _ = self._export_prefix_cache.popitem(last=False)
-                await self._emit_event("evict", prefix_hashes=evicted_prefix)
+                self._emit_event("evict", prefix_hashes=evicted_prefix)
 
     async def _handle(self, request: UDPRequest) -> UDPResponse:
         endpoint = request.data.get("endpoint", "generate")
@@ -244,7 +248,7 @@ class MockWorker:
                 await self._release_capacity(batched_tokens)
 
             self._update_local_cache(local_block_hashes)
-            await self._update_export_prefix_cache(export_prefix_hashes)
+            self._update_export_prefix_cache(export_prefix_hashes)
             return UDPResponse(
                 data={
                     "text": ["<mock output>"],
@@ -270,7 +274,7 @@ class MockWorker:
         self.port = self._server.bound_port()
         if self.worker_id == f"{self.host}:0":
             self.worker_id = f"{self.host}:{self.port}"
-        await self._refresh_queue_depth()
+        self._refresh_queue_depth()
         logger.info(
             "Mock worker listening on %s:%d (ttft=%.1fms, tpot=%.1fms, max_num_seqs=%d, max_num_batched_tokens=%s, controller=%s:%s)",
             self.host,
