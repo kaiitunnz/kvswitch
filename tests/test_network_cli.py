@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import time
 
 from kvswitch.mock.worker import MockWorker
 from kvswitch.network.cli.healthcheck import check_health
@@ -10,6 +11,7 @@ from kvswitch.network.cli.measure_client import main as measure_client_main
 from kvswitch.network.cli.measure_client import (
     measure_latencies,
 )
+from kvswitch.network.cli.workload_client import _send_one
 
 
 def _run_worker(coro):
@@ -60,6 +62,51 @@ class TestMeasureClientCli:
             assert all(latency >= 0.0 for latency in results)
 
         _run_worker(_assert)
+
+    def test_send_one_kvswitch_uses_shim_not_json_prefix_hashes(
+        self, monkeypatch
+    ) -> None:
+        seen: dict[str, object] = {}
+
+        async def _fake_send(
+            self,
+            data: dict,
+            prefix_hashes: list[int] | None = None,
+            req_id: int = 0,
+        ) -> dict:
+            seen["data"] = data
+            seen["prefix_hashes"] = prefix_hashes
+            seen["req_id"] = req_id
+            return {"worker_id": "worker0", "matched_blocks": 0}
+
+        monkeypatch.setattr("kvswitch.sdk.client.KVSwitchUDPClient.send", _fake_send)
+
+        result = asyncio.run(
+            _send_one(
+                {
+                    "request_id": 11,
+                    "prompt_token_ids": [1, 2, 3],
+                    "max_tokens": 4,
+                    "prefix_hashes": [10, 20],
+                    "scheduled_time": 0.0,
+                    "prefix_group": "group_0",
+                },
+                host="127.0.0.1",
+                port=4789,
+                timeout=5.0,
+                t0=time.perf_counter(),
+                kvswitch=True,
+            )
+        )
+
+        assert seen["data"] == {
+            "endpoint": "generate",
+            "prompt_token_ids": [1, 2, 3],
+            "max_tokens": 4,
+        }
+        assert seen["prefix_hashes"] == [10, 20]
+        assert seen["req_id"] == 11
+        assert result["worker_id"] == "worker0"
 
     def test_main_prints_json(self, capsys, monkeypatch) -> None:
         async def _fake_measure_latencies(

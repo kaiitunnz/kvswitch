@@ -17,6 +17,7 @@ import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import cast
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -24,6 +25,7 @@ if str(ROOT) not in sys.path:
 
 from mininet.link import TCLink
 from mininet.net import Mininet
+from mininet.node import Node
 
 from kvswitch.eval.metrics import (
     RequestMetric,
@@ -191,7 +193,12 @@ def _kill_bg(host) -> None:
 
 
 def _collect_results(
-    host, workload_path: str, target_ip: str, target_port: int, timeout: float
+    host: Node,
+    workload_path: str,
+    target_ip: str,
+    target_port: int,
+    timeout: float,
+    kvswitch: bool = False,
 ) -> list[dict]:
     """Run the workload client on a Mininet host and parse JSON output."""
     cmd = _module_cmd(
@@ -201,7 +208,10 @@ def _collect_results(
         port=target_port,
         timeout=timeout,
     )
+    if kvswitch:
+        cmd += " --kvswitch"
     out = host.cmd(cmd)
+    assert isinstance(out, str)
     try:
         lines = [ln.lstrip("> ").strip() for ln in out.strip().split("\n")]
         last = next(ln for ln in reversed(lines) if ln.startswith("["))
@@ -237,6 +247,10 @@ def _to_request_metrics(raw: list[dict], baseline: str) -> list[RequestMetric]:
     return metrics
 
 
+def _get_node(net: Mininet, name: str) -> Node:
+    return cast(Node, net.get(name))
+
+
 # ---------------------------------------------------------------------------
 # Per-baseline experiment functions
 # ---------------------------------------------------------------------------
@@ -250,6 +264,7 @@ def _start_workers(
     max_output_tokens: int,
     controller_host: str | None = None,
     controller_port: int | None = None,
+    kvswitch_port: int | None = None,
 ) -> None:
     """Start mock workers on all worker hosts."""
     for i in range(n_workers):
@@ -262,6 +277,8 @@ def _start_workers(
         )
         if controller_host and controller_port:
             cmd += f" --controller-host {controller_host} --controller-port {controller_port}"
+        if kvswitch_port is not None:
+            cmd += f" --kvswitch-port {kvswitch_port}"
         _start_bg(host, cmd)
 
     # Wait for all workers to be ready.
@@ -272,8 +289,8 @@ def _start_workers(
 
 def _controller_workers_arg(net: Mininet, n_workers: int) -> str:
     """Build the controller worker-placement argument from the live Mininet topology."""
-    spine = net.get("s1")
-    leaf = net.get("s2")
+    spine = _get_node(net, "s1")
+    leaf = _get_node(net, "s2")
 
     spine_port_to_leaf = None
     for port_num, intf in enumerate(spine.intfList()):
@@ -288,7 +305,7 @@ def _controller_workers_arg(net: Mininet, n_workers: int) -> str:
 
     worker_specs: list[str] = []
     for i in range(n_workers):
-        worker = net.get(f"worker{i}")
+        worker = _get_node(net, f"worker{i}")
         leaf_port = None
         for port_num, intf in enumerate(leaf.intfList()):
             if intf.name == "lo" or intf.link is None:
@@ -333,7 +350,7 @@ def run_baseline_l4_rr(
     # For the initial implementation, the client round-robins across worker IPs.
     # The workload_client sends to a single target, so we use worker0.
     # In a full implementation, the BMv2 ECMP table would handle distribution.
-    client = net.get("client")
+    client = _get_node(net, "client")
     raw = _collect_results(
         client, workload_path, worker_ip(0), WORKER_PORT, client_timeout
     )
@@ -357,7 +374,7 @@ def run_baseline_l7(
     _start_workers(net, n_workers, ttft_ms, tpot_ms, max_output_tokens)
 
     # Start L7 proxy on the router host.
-    router_host = net.get("router")
+    router_host = _get_node(net, "router")
     workers_arg = ",".join(f"{worker_ip(i)}:{WORKER_PORT}" for i in range(n_workers))
     proxy_log = "/tmp/l7_proxy.log"
     _start_bg(
@@ -371,7 +388,7 @@ def run_baseline_l7(
         f" > {proxy_log} 2>&1",
     )
 
-    client = net.get("client")
+    client = _get_node(net, "client")
     try:
         _wait_for_service(client, ROUTER_IP, ROUTER_PORT, timeout=120.0)
     except TimeoutError:
@@ -397,14 +414,13 @@ def run_baseline_kvswitch(
     workload_path: str,
     client_timeout: float,
 ) -> list[RequestMetric]:
-    """KVSwitch: SDN controller populates TCAM from worker cache events."""
+    """KVSwitch: SDN controller populates TCAM; switches route shim-header traffic."""
     logger.info("--- Baseline: KVSwitch ---")
 
     # Start SDN controller on the controller host.
-    ctrl_host = net.get("controller")
+    ctrl_host = _get_node(net, "controller")
     ctrl_log = "/tmp/sdn_controller.log"
     workers_arg = _controller_workers_arg(net, n_workers)
-    # TODO: Pass BMv2CLIWriter config for real TCAM programming.
     _start_bg(
         ctrl_host,
         f"{PYTHON} -m kvswitch.controller.sdn_controller"
@@ -413,7 +429,7 @@ def run_baseline_kvswitch(
         f" > {ctrl_log} 2>&1",
     )
 
-    client = net.get("client")
+    client = _get_node(net, "client")
     try:
         _wait_for_service(client, CONTROLLER_IP, CONTROLLER_PORT, timeout=30.0)
     except TimeoutError:
@@ -421,7 +437,10 @@ def run_baseline_kvswitch(
         logger.error("SDN controller log:\n%s", log_out)
         raise
 
-    # Start workers with controller connection.
+    # Start workers with controller connection and KVSwitch listener on
+    # port 4789 so they can receive shim-header traffic from the switches.
+    from kvswitch.sdk.client import KVSWITCH_UDP_PORT
+
     _start_workers(
         net,
         n_workers,
@@ -430,12 +449,25 @@ def run_baseline_kvswitch(
         max_output_tokens,
         controller_host=CONTROLLER_IP,
         controller_port=CONTROLLER_PORT,
+        kvswitch_port=KVSWITCH_UDP_PORT,
     )
 
-    # Client sends directly to worker0 for now.
-    # TODO: With BMv2 TCAM rules, traffic would be routed by the switch.
+    # Client sends with KVSwitch shim header on port 4789.  The BMv2
+    # switches parse the header, match h0/h1/h2 against TCAM rules
+    # (populated by the controller from worker cache events), and
+    # forward to the matched worker's egress port.  On TCAM miss,
+    # the ECMP fallback distributes traffic.
+    #
+    # The destination IP is worker0 but the switch overrides the
+    # egress port based on the shim header match, so the packet may
+    # land on any worker.
     raw = _collect_results(
-        client, workload_path, worker_ip(0), WORKER_PORT, client_timeout
+        client,
+        workload_path,
+        worker_ip(0),
+        KVSWITCH_UDP_PORT,
+        client_timeout,
+        kvswitch=True,
     )
 
     _kill_bg(ctrl_host)
@@ -568,7 +600,7 @@ def main() -> None:
     )
     net = Mininet(
         topo=topo,
-        switch=lambda name, **kw: BMv2Switch(name, json_path=args.p4_json, **kw),
+        switch=lambda name, **kw: BMv2Switch(name, json_path=args.p4_json, **kw),  # type: ignore
         link=TCLink,
         controller=None,
     )

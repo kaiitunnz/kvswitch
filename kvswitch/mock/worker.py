@@ -18,7 +18,9 @@ import logging
 from collections import OrderedDict
 from typing import Any, Final
 
+from kvswitch.sdk.client import KVSWITCH_UDP_PORT
 from kvswitch.sdk.header import KVSwitchShimHeader
+from kvswitch.sdk.server import KVSwitchUDPServerProtocol
 from kvswitch.utils.prefix import (
     cumulative_sha256_chain,
     normalize_prefix_hashes,
@@ -51,6 +53,7 @@ class MockWorker:
         controller_host: str | None = None,
         controller_port: int | None = None,
         max_cached_prefixes: int | None = None,
+        kvswitch_port: int | None = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -63,6 +66,7 @@ class MockWorker:
         self.controller_host = controller_host
         self.controller_port = controller_port
         self.max_cached_prefixes = max_cached_prefixes
+        self.kvswitch_port = kvswitch_port
 
         self._capacity_cond = asyncio.Condition()
         self._active: int = 0
@@ -70,6 +74,7 @@ class MockWorker:
         self._local_block_cache: OrderedDict[bytes, None] = OrderedDict()
         self._export_prefix_cache: OrderedDict[tuple[int, ...], None] = OrderedDict()
         self._server = UDPServer(host=host, port=port, handler=self._handle)
+        self._kvswitch_transport: asyncio.DatagramTransport | None = None
 
     @staticmethod
     def _request_output_tokens(request: UDPRequest) -> int:
@@ -91,17 +96,13 @@ class MockWorker:
 
     @staticmethod
     def _extract_export_prefix_hashes(request: UDPRequest) -> list[int]:
-        header_payload = request.data.get("kvswitch_header")
-        if isinstance(header_payload, dict):
-            return normalize_prefix_hashes(
-                KVSwitchShimHeader.from_dict(header_payload).active_hashes(),
-                max_hashes=MAX_KVSWITCH_HASHES,
-            )
-
-        raw_hashes = request.data.get("prefix_hashes", [])
-        if not isinstance(raw_hashes, list):
+        header_payload = request.data.get("_kvswitch_shim")
+        if not isinstance(header_payload, dict):
             return []
-        return normalize_prefix_hashes(raw_hashes, max_hashes=MAX_KVSWITCH_HASHES)
+        return normalize_prefix_hashes(
+            KVSwitchShimHeader.from_dict(header_payload).active_hashes(),
+            max_hashes=MAX_KVSWITCH_HASHES,
+        )
 
     def _matched_local_blocks(self, block_hashes: list[bytes]) -> int:
         matched = 0
@@ -274,6 +275,24 @@ class MockWorker:
         self.port = self._server.bound_port()
         if self.worker_id == f"{self.host}:0":
             self.worker_id = f"{self.host}:{self.port}"
+
+        # Start a second listener on the KVSwitch UDP port (4789) that
+        # strips the binary shim header before dispatching to _handle.
+        if self.kvswitch_port is not None:
+            loop = asyncio.get_running_loop()
+            self._kvswitch_transport, _ = await loop.create_datagram_endpoint(
+                lambda: KVSwitchUDPServerProtocol(self._handle),
+                local_addr=(self.host, self.kvswitch_port),
+            )
+            sockname = self._kvswitch_transport.get_extra_info("sockname")
+            if isinstance(sockname, tuple) and len(sockname) >= 2:
+                self.kvswitch_port = int(sockname[1])
+            logger.info(
+                "Mock worker KVSwitch listener on %s:%d",
+                self.host,
+                self.kvswitch_port,
+            )
+
         self._refresh_queue_depth()
         logger.info(
             "Mock worker listening on %s:%d (ttft=%.1fms, tpot=%.1fms, max_num_seqs=%d, max_num_batched_tokens=%s, controller=%s:%s)",
@@ -289,6 +308,8 @@ class MockWorker:
 
     def close(self) -> None:
         self._server.close()
+        if self._kvswitch_transport is not None:
+            self._kvswitch_transport.close()
 
     async def run_forever(self) -> None:
         await self.start()
@@ -325,6 +346,12 @@ if __name__ == "__main__":
     parser.add_argument("--controller-host", type=str, default=None)
     parser.add_argument("--controller-port", type=int, default=None)
     parser.add_argument("--max-cached-prefixes", type=int, default=None)
+    parser.add_argument(
+        "--kvswitch-port",
+        type=int,
+        default=None,
+        help=f"Also listen on this port for KVSwitch shim-header traffic (default: {KVSWITCH_UDP_PORT})",
+    )
     parser.add_argument("--log-level", type=str, default="INFO")
     args = parser.parse_args()
 
@@ -342,5 +369,6 @@ if __name__ == "__main__":
             controller_host=args.controller_host,
             controller_port=args.controller_port,
             max_cached_prefixes=args.max_cached_prefixes,
+            kvswitch_port=args.kvswitch_port,
         ).run_forever()
     )

@@ -10,6 +10,8 @@ from kvswitch.mock.worker import (
     DEFAULT_MAX_NUM_SEQS,
     MockWorker,
 )
+from kvswitch.sdk.client import KVSwitchUDPClient
+from kvswitch.sdk.hashing import compute_truncated_hashes
 from kvswitch.utils.udp import UDPClient
 
 
@@ -58,6 +60,69 @@ class TestMockWorkerEndpoints:
             assert resp["prompt_tokens"] == 3
             assert resp["simulated_ttft_ms"] == pytest.approx(1.0)
             assert resp["worker_port"] == port
+
+            worker.close()
+
+        asyncio.run(_run())
+
+    def test_generate_via_kvswitch_shim_uses_header_hashes(self) -> None:
+        async def _run() -> None:
+            prompt_token_ids = list(range(512))
+            prefix_hashes = compute_truncated_hashes(prompt_token_ids, b"kvswitch-eval")
+            worker = MockWorker(
+                host="127.0.0.1",
+                port=0,
+                kvswitch_port=0,
+                ttft_ms=1.0,
+            )
+            await worker.start()
+            assert worker.kvswitch_port is not None
+
+            client = KVSwitchUDPClient(
+                host="127.0.0.1",
+                port=worker.kvswitch_port,
+                timeout=5.0,
+            )
+            resp = await client.send(
+                {
+                    "endpoint": "generate",
+                    "prompt_token_ids": prompt_token_ids,
+                },
+                prefix_hashes=prefix_hashes,
+                req_id=7,
+            )
+
+            assert resp["prompt_tokens"] == 512
+            assert resp["exported_prefixes"] == len(prefix_hashes)
+            assert list(worker._export_prefix_cache.keys()) == [
+                tuple(prefix_hashes[:1]),
+                tuple(prefix_hashes[:2]),
+            ]
+
+            worker.close()
+
+        asyncio.run(_run())
+
+    def test_plain_udp_prefix_hashes_are_ignored_on_receive_side(self) -> None:
+        async def _run() -> None:
+            prompt_token_ids = list(range(512))
+            prefix_hashes = compute_truncated_hashes(prompt_token_ids, b"kvswitch-eval")
+            worker = MockWorker(host="127.0.0.1", port=0, ttft_ms=1.0)
+            await worker.start()
+            port = _get_port(worker)
+
+            client = UDPClient(host="127.0.0.1", port=port, timeout=5.0)
+            resp = await client.send(
+                {
+                    "endpoint": "generate",
+                    "prompt_token_ids": prompt_token_ids,
+                    "prefix_hashes": prefix_hashes,
+                }
+            )
+
+            assert resp["prompt_tokens"] == 512
+            assert resp["exported_prefixes"] == 0
+            assert list(worker._export_prefix_cache.keys()) == []
 
             worker.close()
 

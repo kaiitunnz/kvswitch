@@ -16,7 +16,10 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from kvswitch.sdk.hashing import compute_truncated_hashes
+
 logger = logging.getLogger(__name__)
+DEFAULT_HASH_KEY = "kvswitch-eval"
 
 
 @dataclass
@@ -28,6 +31,7 @@ class WorkloadRequest:
     scheduled_time: float  # seconds from experiment start
     prefix_group: str  # "group_0" … "group_N" or "none"
     max_tokens: int
+    prefix_hashes: list[int] | None = None  # truncated 32-bit hashes for shim header
 
 
 @dataclass
@@ -44,6 +48,7 @@ class WorkloadConfig:
     max_output_tokens: int = 16
     seed: int = 42
     model: str = "meta-llama/Llama-3.2-3B-Instruct"
+    hash_key: str = DEFAULT_HASH_KEY
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +182,11 @@ class WorkloadGenerator:
             else:
                 t += 0.0  # All at once.
 
+            # Compute prefix hashes for the KVSwitch shim header.
+            prefix_hashes = compute_truncated_hashes(
+                prompt_ids, cfg.hash_key.encode("utf-8")
+            )
+
             requests.append(
                 WorkloadRequest(
                     request_id=i,
@@ -184,6 +194,7 @@ class WorkloadGenerator:
                     scheduled_time=t,
                     prefix_group=group,
                     max_tokens=cfg.max_output_tokens,
+                    prefix_hashes=prefix_hashes,
                 )
             )
 
@@ -220,6 +231,11 @@ def load_workload(path: Path) -> list[WorkloadRequest]:
             scheduled_time=r["scheduled_time"],
             prefix_group=r["prefix_group"],
             max_tokens=r["max_tokens"],
+            prefix_hashes=(
+                [int(value) for value in r["prefix_hashes"]]
+                if r.get("prefix_hashes") is not None
+                else None
+            ),
         )
         for r in data
     ]
