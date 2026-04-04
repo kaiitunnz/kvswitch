@@ -103,6 +103,39 @@ def build_latency_tables(
     return ttft_table, tpot_table
 
 
+def fit_linear_ttft_model(
+    traces_path: Path,
+) -> tuple[float, float]:
+    """Fit TTFT_ms = base + per_token * uncached_tokens from profiling traces.
+
+    Returns ``(base_ttft_ms, per_token_ttft_ms)``.
+    """
+    results = load_results_csv(traces_path)
+    xs: list[float] = []  # uncached_tokens
+    ys: list[float] = []  # ttft_ms
+    for r in results:
+        uncached = r.prompt_tokens - r.num_cached_tokens
+        xs.append(float(uncached))
+        ys.append(r.ttft * 1000)
+
+    n = len(xs)
+    if n < 2:
+        return 12.0, 0.014  # sensible defaults
+
+    # From closed-form solution to linear regression
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    ss_xy = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+    ss_xx = sum((x - mean_x) ** 2 for x in xs)
+
+    if ss_xx == 0:
+        return mean_y, 0.0
+
+    per_token = ss_xy / ss_xx
+    base = mean_y - per_token * mean_x
+    return max(base, 0.0), max(per_token, 0.0)
+
+
 # ---------------------------------------------------------------------------
 # Mininet helpers
 # ---------------------------------------------------------------------------
@@ -430,12 +463,14 @@ def _get_node(net: Mininet, name: str) -> Node:
 def _start_workers(
     net: Mininet,
     n_workers: int,
-    ttft_ms: float,
     tpot_ms: float,
     max_output_tokens: int,
     controller_host: str | None = None,
     controller_port: int | None = None,
     kvswitch_port: int | None = None,
+    base_ttft_ms: float | None = None,
+    per_token_ttft_ms: float | None = None,
+    ttft_ms: float = 10.0,
 ) -> None:
     """Start mock workers on all worker hosts."""
     for i in range(n_workers):
@@ -446,6 +481,8 @@ def _start_workers(
             f" --ttft-ms {ttft_ms} --tpot-ms {tpot_ms}"
             f" --worker-id worker{i}"
         )
+        if base_ttft_ms is not None and per_token_ttft_ms is not None:
+            cmd += f" --base-ttft-ms {base_ttft_ms} --per-token-ttft-ms {per_token_ttft_ms}"
         if controller_host and controller_port:
             cmd += f" --controller-host {controller_host} --controller-port {controller_port}"
         if kvswitch_port is not None:
@@ -517,10 +554,20 @@ def run_baseline_l4_rr(
     max_output_tokens: int,
     workload_path: str,
     client_timeout: float,
+    base_ttft_ms: float | None = None,
+    per_token_ttft_ms: float | None = None,
 ) -> list[RequestMetric]:
     """L4 Round-Robin: TCAM empty → ECMP distributes traffic."""
     logger.info("--- Baseline: L4 Round-Robin ---")
-    _start_workers(net, n_workers, ttft_ms, tpot_ms, max_output_tokens)
+    _start_workers(
+        net,
+        n_workers,
+        tpot_ms,
+        max_output_tokens,
+        base_ttft_ms=base_ttft_ms,
+        per_token_ttft_ms=per_token_ttft_ms,
+        ttft_ms=ttft_ms,
+    )
 
     # Pre-populate ECMP tables with uniform weights for all workers.
     # For now, workers are reachable directly; ECMP hashing distributes.
@@ -548,10 +595,20 @@ def run_baseline_l7(
     workload_path: str,
     model: str,
     client_timeout: float,
+    base_ttft_ms: float | None = None,
+    per_token_ttft_ms: float | None = None,
 ) -> list[RequestMetric]:
     """L7 Prefix-Aware: Client → L7 proxy → best worker."""
     logger.info("--- Baseline: L7 Prefix-Aware Router ---")
-    _start_workers(net, n_workers, ttft_ms, tpot_ms, max_output_tokens)
+    _start_workers(
+        net,
+        n_workers,
+        tpot_ms,
+        max_output_tokens,
+        base_ttft_ms=base_ttft_ms,
+        per_token_ttft_ms=per_token_ttft_ms,
+        ttft_ms=ttft_ms,
+    )
 
     # Start L7 proxy on the router host.
     router_host = _get_node(net, "router")
@@ -633,6 +690,8 @@ def run_baseline_kvswitch(
     client_timeout: float,
     adapter: FinsyAdapter,
     controller_runtime: AsyncLoopThread,
+    base_ttft_ms: float | None = None,
+    per_token_ttft_ms: float | None = None,
 ) -> list[RequestMetric]:
     """KVSwitch: SDN controller populates TCAM; switches route shim-header traffic."""
     logger.info("--- Baseline: KVSwitch ---")
@@ -667,12 +726,14 @@ def run_baseline_kvswitch(
     _start_workers(
         net,
         n_workers,
-        ttft_ms,
         tpot_ms,
         max_output_tokens,
         controller_host=CONTROLLER_IP,
         controller_port=CONTROLLER_PORT,
         kvswitch_port=KVSWITCH_UDP_PORT,
+        base_ttft_ms=base_ttft_ms,
+        per_token_ttft_ms=per_token_ttft_ms,
+        ttft_ms=ttft_ms,
     )
 
     raw = _collect_results(
@@ -745,6 +806,18 @@ def main() -> None:
     parser.add_argument(
         "--tpot-ms", type=float, default=None, help="Override TPOT (else from traces)"
     )
+    parser.add_argument(
+        "--base-ttft-ms",
+        type=float,
+        default=None,
+        help="Override base TTFT for linear model (else fitted from traces)",
+    )
+    parser.add_argument(
+        "--per-token-ttft-ms",
+        type=float,
+        default=None,
+        help="Override per-token TTFT for linear model (else fitted from traces)",
+    )
     parser.add_argument("--client-timeout", type=float, default=60.0)
     parser.add_argument("--output-dir", type=str, default="results/eval")
     parser.add_argument("--seed", type=int, default=42)
@@ -773,7 +846,23 @@ def main() -> None:
     # Default TTFT/TPOT: use 1024-token, 0% prefix ratio as representative.
     ttft_ms = args.ttft_ms or ttft_table.get((1024, 0.0), 15.0)
     tpot_ms = args.tpot_ms or tpot_table.get((1024, 0.0), 3.0)
-    logger.info("Using TTFT=%.2fms, TPOT=%.2fms", ttft_ms, tpot_ms)
+
+    # Fit the linear TTFT model from traces (or use CLI overrides).
+    if args.base_ttft_ms is not None and args.per_token_ttft_ms is not None:
+        base_ttft_ms = args.base_ttft_ms
+        per_token_ttft_ms = args.per_token_ttft_ms
+    elif traces_path.exists():
+        base_ttft_ms, per_token_ttft_ms = fit_linear_ttft_model(traces_path)
+    else:
+        base_ttft_ms, per_token_ttft_ms = 12.9, 0.01406  # sensible defaults
+
+    logger.info(
+        "Using TTFT model: base=%.2fms + %.5fms/uncached_token (fallback fixed=%.2fms), TPOT=%.2fms",
+        base_ttft_ms,
+        per_token_ttft_ms,
+        ttft_ms,
+        tpot_ms,
+    )
 
     # --- Generate workload ---
     logger.info("Generating workload...")
@@ -856,6 +945,8 @@ def main() -> None:
                     args.max_output_tokens,
                     workload_path,
                     args.client_timeout,
+                    base_ttft_ms=base_ttft_ms,
+                    per_token_ttft_ms=per_token_ttft_ms,
                 )
             elif baseline == "l7":
                 metrics = run_baseline_l7(
@@ -867,6 +958,8 @@ def main() -> None:
                     workload_path,
                     args.model,
                     args.client_timeout,
+                    base_ttft_ms=base_ttft_ms,
+                    per_token_ttft_ms=per_token_ttft_ms,
                 )
             elif baseline == "kvswitch":
                 metrics = run_baseline_kvswitch(
@@ -879,6 +972,8 @@ def main() -> None:
                     args.client_timeout,
                     adapter=finsy_adapter,
                     controller_runtime=controller_runtime,
+                    base_ttft_ms=base_ttft_ms,
+                    per_token_ttft_ms=per_token_ttft_ms,
                 )
             else:
                 continue
@@ -916,6 +1011,8 @@ def main() -> None:
         "system_prompt_tokens": args.system_prompt_tokens,
         "max_output_tokens": args.max_output_tokens,
         "ttft_ms": ttft_ms,
+        "base_ttft_ms": base_ttft_ms,
+        "per_token_ttft_ms": per_token_ttft_ms,
         "tpot_ms": tpot_ms,
         "delay": args.delay,
         "model": args.model,

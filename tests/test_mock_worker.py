@@ -284,14 +284,47 @@ class TestBatchCapacity:
 
         asyncio.run(_run())
 
-    def test_queued_request_observes_cache_updates_from_prior_request(self) -> None:
+    def test_sequential_requests_observe_cache_updates(self) -> None:
+        """A request sent after a prior one completes sees the cached prefix."""
+
+        async def _run() -> None:
+            prompt_token_ids = list(range(32))
+            worker = MockWorker(
+                host="127.0.0.1",
+                port=0,
+                ttft_ms=1.0,
+                max_num_seqs=1,
+            )
+            await worker.start()
+            port = _get_port(worker)
+
+            client = UDPClient(host="127.0.0.1", port=port, timeout=5.0)
+            first = await client.send(
+                {"endpoint": "generate", "prompt_token_ids": prompt_token_ids}
+            )
+            second = await client.send(
+                {"endpoint": "generate", "prompt_token_ids": prompt_token_ids}
+            )
+
+            assert first["matched_blocks"] == 0
+            assert first["num_cached_tokens"] == 0
+            assert second["matched_blocks"] == 2
+            assert second["num_cached_tokens"] == 32
+
+            worker.close()
+
+        asyncio.run(_run())
+
+    def test_concurrent_requests_both_miss_cache(self) -> None:
+        """Two requests arriving simultaneously both miss the cache."""
+
         async def _run() -> None:
             prompt_token_ids = list(range(32))
             worker = MockWorker(
                 host="127.0.0.1",
                 port=0,
                 ttft_ms=40.0,
-                max_num_seqs=1,
+                max_num_seqs=2,
             )
             await worker.start()
             port = _get_port(worker)
@@ -299,10 +332,7 @@ class TestBatchCapacity:
             async def _send() -> dict:
                 client = UDPClient(host="127.0.0.1", port=port, timeout=5.0)
                 return await client.send(
-                    {
-                        "endpoint": "generate",
-                        "prompt_token_ids": prompt_token_ids,
-                    }
+                    {"endpoint": "generate", "prompt_token_ids": prompt_token_ids}
                 )
 
             first_task = asyncio.create_task(_send())
@@ -310,10 +340,9 @@ class TestBatchCapacity:
             second_task = asyncio.create_task(_send())
             first, second = await asyncio.gather(first_task, second_task)
 
+            # Both arrive before either completes — both miss the cache.
             assert first["matched_blocks"] == 0
-            assert first["num_cached_tokens"] == 0
-            assert second["matched_blocks"] == 2
-            assert second["num_cached_tokens"] == 32
+            assert second["matched_blocks"] == 0
 
             worker.close()
 
@@ -414,6 +443,166 @@ class TestBatchCapacity:
             assert resp["active_batched_tokens"] >= 5
 
             await gen_task
+            worker.close()
+
+        asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# Cache-aware TTFT and token budget
+# ---------------------------------------------------------------------------
+
+
+class TestCacheAwareTTFT:
+    def test_cache_hit_reduces_simulated_ttft(self) -> None:
+        """Second request with cached prefix has lower TTFT."""
+
+        async def _run() -> None:
+            prompt_token_ids = list(range(64))
+            worker = MockWorker(
+                host="127.0.0.1",
+                port=0,
+                base_ttft_ms=10.0,
+                per_token_ttft_ms=0.5,
+                tpot_ms=0.0,
+                max_num_seqs=1,
+            )
+            await worker.start()
+            port = _get_port(worker)
+
+            client = UDPClient(host="127.0.0.1", port=port, timeout=5.0)
+            first = await client.send(
+                {"endpoint": "generate", "prompt_token_ids": prompt_token_ids}
+            )
+            second = await client.send(
+                {"endpoint": "generate", "prompt_token_ids": prompt_token_ids}
+            )
+
+            # First: uncached=64, TTFT = 10 + 0.5*64 = 42 ms.
+            assert first["simulated_ttft_ms"] == pytest.approx(42.0)
+            assert first["uncached_tokens"] == 64
+
+            # Second: all 4 blocks cached, uncached=0, TTFT = 10 ms.
+            assert second["simulated_ttft_ms"] == pytest.approx(10.0)
+            assert second["uncached_tokens"] == 0
+
+            worker.close()
+
+        asyncio.run(_run())
+
+    def test_partial_cache_hit(self) -> None:
+        """Request sharing a prefix gets reduced TTFT for the uncached portion."""
+
+        async def _run() -> None:
+            worker = MockWorker(
+                host="127.0.0.1",
+                port=0,
+                base_ttft_ms=10.0,
+                per_token_ttft_ms=0.5,
+                tpot_ms=0.0,
+            )
+            await worker.start()
+            port = _get_port(worker)
+
+            client = UDPClient(host="127.0.0.1", port=port, timeout=5.0)
+            await client.send(
+                {"endpoint": "generate", "prompt_token_ids": list(range(64))}
+            )
+            resp = await client.send(
+                {"endpoint": "generate", "prompt_token_ids": list(range(80))}
+            )
+
+            assert resp["matched_blocks"] == 4
+            assert resp["uncached_tokens"] == 16
+            assert resp["simulated_ttft_ms"] == pytest.approx(10.0 + 0.5 * 16)
+
+            worker.close()
+
+        asyncio.run(_run())
+
+    def test_token_budget_uses_uncached_tokens(self) -> None:
+        """Cached tokens don't count against the token budget."""
+
+        async def _run() -> None:
+            prompt = list(range(48))
+            worker = MockWorker(
+                host="127.0.0.1",
+                port=0,
+                base_ttft_ms=5.0,
+                per_token_ttft_ms=0.01,
+                tpot_ms=0.0,
+                max_num_batched_tokens=50,
+            )
+            await worker.start()
+            port = _get_port(worker)
+
+            client = UDPClient(host="127.0.0.1", port=port, timeout=5.0)
+            first = await client.send(
+                {"endpoint": "generate", "prompt_token_ids": prompt}
+            )
+            assert first["batched_tokens"] == 49
+
+            new_prompt = list(range(100, 148))
+
+            async def _send(tokens: list[int]) -> dict:
+                c = UDPClient(host="127.0.0.1", port=port, timeout=5.0)
+                return await c.send(
+                    {"endpoint": "generate", "prompt_token_ids": tokens}
+                )
+
+            cached_task = asyncio.create_task(_send(prompt))
+            new_task = asyncio.create_task(_send(new_prompt))
+            cached_resp, new_resp = await asyncio.gather(cached_task, new_task)
+
+            assert cached_resp["batched_tokens"] == 1
+            assert new_resp["batched_tokens"] == 49
+
+            worker.close()
+
+        asyncio.run(_run())
+
+    def test_fallback_to_fixed_ttft(self) -> None:
+        """Without linear params, TTFT stays fixed regardless of cache state."""
+
+        async def _run() -> None:
+            prompt_token_ids = list(range(64))
+            worker = MockWorker(
+                host="127.0.0.1",
+                port=0,
+                ttft_ms=25.0,
+                tpot_ms=0.0,
+            )
+            await worker.start()
+            port = _get_port(worker)
+
+            client = UDPClient(host="127.0.0.1", port=port, timeout=5.0)
+            first = await client.send(
+                {"endpoint": "generate", "prompt_token_ids": prompt_token_ids}
+            )
+            second = await client.send(
+                {"endpoint": "generate", "prompt_token_ids": prompt_token_ids}
+            )
+
+            assert first["simulated_ttft_ms"] == pytest.approx(25.0)
+            assert second["simulated_ttft_ms"] == pytest.approx(25.0)
+
+            worker.close()
+
+        asyncio.run(_run())
+
+    def test_response_includes_uncached_tokens(self) -> None:
+        async def _run() -> None:
+            worker = MockWorker(host="127.0.0.1", port=0, ttft_ms=1.0)
+            await worker.start()
+            port = _get_port(worker)
+
+            client = UDPClient(host="127.0.0.1", port=port, timeout=5.0)
+            resp = await client.send(
+                {"endpoint": "generate", "prompt_token_ids": list(range(32))}
+            )
+            assert resp["uncached_tokens"] == 32
+            assert resp["prompt_tokens"] == 32
+
             worker.close()
 
         asyncio.run(_run())

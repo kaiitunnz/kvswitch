@@ -18,6 +18,7 @@ def _make_metric(**overrides) -> RequestMetric:
         request_id=0,
         baseline="l4_rr",
         e2e_latency_ms=20.0,
+        ttft_ms=12.0,
         simulated_ttft_ms=10.0,
         simulated_tpot_ms=3.0,
         simulated_e2e_ms=19.0,
@@ -63,7 +64,7 @@ class TestComputeSummary:
         assert summary["n_requests"] == 3
         assert summary["e2e_mean_ms"] == pytest.approx(20.0)
         assert summary["e2e_p50_ms"] == pytest.approx(20.0)
-        assert summary["ttft_mean_ms"] == pytest.approx(10.0)
+        assert summary["ttft_mean_ms"] == pytest.approx(12.0)
         assert summary["throughput_rps"] == pytest.approx(3.0)
 
     def test_empty(self) -> None:

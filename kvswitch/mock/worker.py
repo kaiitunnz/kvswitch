@@ -54,11 +54,17 @@ class MockWorker:
         controller_port: int | None = None,
         max_cached_prefixes: int | None = None,
         kvswitch_port: int | None = None,
+        base_ttft_ms: float | None = None,
+        per_token_ttft_ms: float | None = None,
     ) -> None:
         self.host = host
         self.port = port
         self.ttft_s = ttft_ms / 1000.0
         self.tpot_s = tpot_ms / 1000.0
+        self._base_ttft_s = base_ttft_ms / 1000.0 if base_ttft_ms is not None else None
+        self._per_token_ttft_s = (
+            per_token_ttft_ms / 1000.0 if per_token_ttft_ms is not None else None
+        )
         self.max_num_seqs = max_num_seqs
         self.max_num_batched_tokens = max_num_batched_tokens
         self.block_size = block_size
@@ -112,6 +118,20 @@ class MockWorker:
             self._local_block_cache.move_to_end(block_hash)
             matched += 1
         return matched
+
+    def _compute_ttft_s(self, uncached_tokens: int) -> float:
+        """Compute TTFT based on uncached token count.
+
+        If ``base_ttft_ms`` and ``per_token_ttft_ms`` were provided at
+        construction, TTFT is calculated as
+
+        ``ttft = base_ttft + per_token_ttft * uncached_tokens``
+
+        Otherwise, the fixed ``ttft_ms`` is used.
+        """
+        if self._base_ttft_s is not None and self._per_token_ttft_s is not None:
+            return self._base_ttft_s + self._per_token_ttft_s * uncached_tokens
+        return self.ttft_s
 
     def _emit_event(
         self,
@@ -224,29 +244,41 @@ class MockWorker:
             prompt_token_ids = request.data.get("prompt_token_ids", [])
             prompt_tokens = len(prompt_token_ids) if prompt_token_ids else 0
             output_tokens = self._request_output_tokens(request)
-            batched_tokens = self._request_batched_tokens(request)
             local_block_hashes = self._local_block_hashes(prompt_token_ids)
             export_prefix_hashes = self._extract_export_prefix_hashes(request)
 
-            if not await self._acquire_capacity(batched_tokens):
+            # Check cache before acquiring capacity
+            matched_blocks = self._matched_local_blocks(local_block_hashes)
+            num_cached_tokens = matched_blocks * self.block_size
+            uncached_tokens = max(prompt_tokens - num_cached_tokens, 0)
+
+            # Only uncached prompt tokens are charged as prefill work here,
+            # so repeated prefixes lower the worker's simulated batching load.
+            # This is intentionally a simple admission-control approximation:
+            # it treats each request as contributing its own uncached prefill
+            # tokens plus output tokens, without trying to model exact shared
+            # live KV/cache residency across concurrent requests.
+            effective_batched_tokens = max(uncached_tokens + output_tokens, 1)
+
+            if not await self._acquire_capacity(effective_batched_tokens):
                 return UDPResponse(
                     data={
                         "error": (
                             "request exceeds max_num_batched_tokens: "
-                            f"required={batched_tokens} "
+                            f"required={effective_batched_tokens} "
                             f"limit={self.max_num_batched_tokens}"
                         )
                     }
                 )
 
-            matched_blocks = self._matched_local_blocks(local_block_hashes)
-            num_cached_tokens = matched_blocks * self.block_size
-
             try:
-                simulated_e2e_s = self.ttft_s + max(output_tokens - 1, 0) * self.tpot_s
+                simulated_ttft_s = self._compute_ttft_s(uncached_tokens)
+                simulated_e2e_s = (
+                    simulated_ttft_s + max(output_tokens - 1, 0) * self.tpot_s
+                )
                 await asyncio.sleep(simulated_e2e_s)
             finally:
-                await self._release_capacity(batched_tokens)
+                await self._release_capacity(effective_batched_tokens)
 
             self._update_local_cache(local_block_hashes)
             self._update_export_prefix_cache(export_prefix_hashes)
@@ -255,14 +287,15 @@ class MockWorker:
                     "text": ["<mock output>"],
                     "num_cached_tokens": num_cached_tokens,
                     "matched_blocks": matched_blocks,
+                    "uncached_tokens": uncached_tokens,
                     "worker_id": self.worker_id,
                     "worker_port": self.port,
-                    "simulated_ttft_ms": self.ttft_s * 1000,
+                    "simulated_ttft_ms": simulated_ttft_s * 1000,
                     "simulated_tpot_ms": self.tpot_s * 1000,
                     "simulated_e2e_ms": simulated_e2e_s * 1000,
                     "prompt_tokens": prompt_tokens,
                     "output_tokens": output_tokens,
-                    "batched_tokens": batched_tokens,
+                    "batched_tokens": effective_batched_tokens,
                     "cached_prefixes": len(self._local_block_cache),
                     "exported_prefixes": len(self._export_prefix_cache),
                 }
@@ -294,11 +327,15 @@ class MockWorker:
             )
 
         self._refresh_queue_depth()
+        if self._base_ttft_s is not None and self._per_token_ttft_s is not None:
+            ttft_desc = f"base_ttft={self._base_ttft_s*1000:.1f}ms + {self._per_token_ttft_s*1000:.5f}ms/token"
+        else:
+            ttft_desc = f"ttft={self.ttft_s*1000:.1f}ms"
         logger.info(
-            "Mock worker listening on %s:%d (ttft=%.1fms, tpot=%.1fms, max_num_seqs=%d, max_num_batched_tokens=%s, controller=%s:%s)",
+            "Mock worker listening on %s:%d (%s, tpot=%.1fms, max_num_seqs=%d, max_num_batched_tokens=%s, controller=%s:%s)",
             self.host,
             self.port,
-            self.ttft_s * 1000,
+            ttft_desc,
             self.tpot_s * 1000,
             self.max_num_seqs,
             self.max_num_batched_tokens,
@@ -352,6 +389,18 @@ if __name__ == "__main__":
         default=None,
         help=f"Also listen on this port for KVSwitch shim-header traffic (default: {KVSWITCH_UDP_PORT})",
     )
+    parser.add_argument(
+        "--base-ttft-ms",
+        type=float,
+        default=None,
+        help="Baseline TTFT when fully cached (enables linear TTFT model)",
+    )
+    parser.add_argument(
+        "--per-token-ttft-ms",
+        type=float,
+        default=None,
+        help="Marginal TTFT per uncached token (enables linear TTFT model)",
+    )
     parser.add_argument("--log-level", type=str, default="INFO")
     args = parser.parse_args()
 
@@ -370,5 +419,7 @@ if __name__ == "__main__":
             controller_port=args.controller_port,
             max_cached_prefixes=args.max_cached_prefixes,
             kvswitch_port=args.kvswitch_port,
+            base_ttft_ms=args.base_ttft_ms,
+            per_token_ttft_ms=args.per_token_ttft_ms,
         ).run_forever()
     )
