@@ -5,6 +5,7 @@ description = "KVSwitch"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "finsy>=0.26.0",
     "mininet>=2.3.0.dev6",
     "pandas>=3.0.1",
 ]
@@ -47,7 +48,7 @@ ignore_missing_imports = true
 files = ["kvswitch"]
 
 [tool.codespell]
-ignore-words-list = ["assertIn"]
+ignore-words-list = ["assertIn", "inout"]
 skip = ["3rdparty", ".venv", "data", "results", "*.ipynb", "tmp"]
 
 [tool.pyright]

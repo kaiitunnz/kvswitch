@@ -5,6 +5,8 @@ This preserves the planned alloc/evict/queue_update protocol while remaining
 lightweight and testable inside the current Python-only prototype.
 """
 
+import argparse
+import asyncio
 import logging
 import subprocess
 import time
@@ -13,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
 from kvswitch.controller.tcam_manager import PrefixKey, TcamManager
+from kvswitch.utils.logger import setup_logging
 from kvswitch.utils.prefix import (
     format_prefix_key,
     leaf_prefix_key,
@@ -25,6 +28,35 @@ logger = logging.getLogger(__name__)
 
 EventType = Literal["alloc", "evict", "queue_update"]
 ECMP_BUCKETS = 32
+
+
+def parse_worker_placement(spec: str) -> "WorkerPlacement":
+    """Parse ``worker_id,leaf_switch,worker_ip,spine_port,leaf_port``."""
+    parts = [part.strip() for part in spec.split(",")]
+    if len(parts) != 5:
+        raise ValueError(
+            "worker spec must be worker_id,leaf_switch,worker_ip,spine_port,leaf_port"
+        )
+    worker_id, leaf_switch, worker_ip, raw_spine_port, raw_leaf_port = parts
+    return WorkerPlacement(
+        worker_id=worker_id,
+        leaf_switch=leaf_switch,
+        worker_ip=worker_ip,
+        spine_port=int(raw_spine_port),
+        leaf_port=int(raw_leaf_port),
+    )
+
+
+def parse_worker_placements(specs: str) -> list["WorkerPlacement"]:
+    """Parse ``;``-separated worker placement specs."""
+    placements = [
+        parse_worker_placement(spec)
+        for spec in specs.split(";")
+        if spec.strip()
+    ]
+    if not placements:
+        raise ValueError("at least one worker placement is required")
+    return placements
 
 
 @dataclass(frozen=True)
@@ -473,3 +505,43 @@ class SDNController:
             self._writer.apply(leaf_switch, leaf_commands)
             commands.extend(leaf_commands)
         return commands
+
+    async def run_forever(self) -> None:
+        await self.start()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            self.close()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="KVSwitch SDN controller")
+    parser.add_argument("--host", type=str, default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=9100)
+    parser.add_argument("--workers", type=str, required=True)
+    parser.add_argument("--admission-threshold", type=int, default=2)
+    parser.add_argument("--window-s", type=float, default=60.0)
+    parser.add_argument("--max-spine-entries", type=int, default=1024)
+    parser.add_argument("--max-leaf-entries", type=int, default=1024)
+    parser.add_argument("--alpha", type=float, default=1.0)
+    parser.add_argument("--beta", type=float, default=1.0)
+    parser.add_argument("--log-level", type=str, default="INFO")
+    args = parser.parse_args()
+
+    setup_logging(args.log_level)
+    controller = SDNController(
+        workers=parse_worker_placements(args.workers),
+        host=args.host,
+        port=args.port,
+        admission_threshold=args.admission_threshold,
+        window_s=args.window_s,
+        max_spine_entries=args.max_spine_entries,
+        max_leaf_entries=args.max_leaf_entries,
+        alpha=args.alpha,
+        beta=args.beta,
+    )
+    asyncio.run(controller.run_forever())
+
+
+if __name__ == "__main__":
+    main()

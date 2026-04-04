@@ -28,6 +28,10 @@ control KVSwitchIngress(
         mark_to_drop(standard_metadata);
     }
 
+    action forward(bit<9> port) {
+        standard_metadata.egress_spec = port;
+    }
+
     action compute_ecmp_bucket() {
         hash(
             meta.ecmp_bucket,
@@ -42,6 +46,20 @@ control KVSwitchIngress(
             },
             ECMP_BUCKET_COUNT
         );
+    }
+
+    // Basic IPv4 forwarding for non-KVSwitch traffic (ARP, ping, etc.).
+    table ipv4_lpm {
+        key = {
+            hdr.ipv4.dstAddr: lpm;
+        }
+        actions = {
+            forward;
+            drop;
+            NoAction;
+        }
+        size = 256;
+        default_action = NoAction();
     }
 
     table spine_prefix_route {
@@ -96,6 +114,7 @@ control KVSwitchIngress(
 
     apply {
         if (hdr.kvswitch.isValid()) {
+            // KVSwitch shim header present — use prefix-aware routing.
             if (!leaf_prefix_route.apply().hit) {
                 if (!spine_prefix_route.apply().hit) {
                     compute_ecmp_bucket();
@@ -104,6 +123,9 @@ control KVSwitchIngress(
                     }
                 }
             }
+        } else if (hdr.ipv4.isValid()) {
+            // Regular IPv4 traffic — basic LPM forwarding.
+            ipv4_lpm.apply();
         }
     }
 }
