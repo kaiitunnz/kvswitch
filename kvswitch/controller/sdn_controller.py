@@ -8,12 +8,19 @@ lightweight and testable inside the current Python-only prototype.
 import argparse
 import asyncio
 import logging
-import subprocess
 import time
 from collections import defaultdict
-from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol
+from dataclasses import dataclass
+from typing import Any, Literal
 
+from kvswitch.controller.switch_adapter import (
+    InMemorySwitchAdapter,
+    SwitchAdapter,
+    SwitchOp,
+    TableAddOp,
+    TableClearOp,
+    TableDeleteOp,
+)
 from kvswitch.controller.tcam_manager import PrefixKey, TcamManager
 from kvswitch.utils.logger import setup_logging
 from kvswitch.utils.prefix import (
@@ -31,17 +38,19 @@ ECMP_BUCKETS = 32
 
 
 def parse_worker_placement(spec: str) -> "WorkerPlacement":
-    """Parse ``worker_id,leaf_switch,worker_ip,spine_port,leaf_port``."""
+    """Parse ``worker_id,leaf_switch,worker_ip,worker_mac,spine_port,leaf_port``."""
     parts = [part.strip() for part in spec.split(",")]
-    if len(parts) != 5:
+    if len(parts) != 6:
         raise ValueError(
-            "worker spec must be worker_id,leaf_switch,worker_ip,spine_port,leaf_port"
+            "worker spec must be "
+            "worker_id,leaf_switch,worker_ip,worker_mac,spine_port,leaf_port"
         )
-    worker_id, leaf_switch, worker_ip, raw_spine_port, raw_leaf_port = parts
+    worker_id, leaf_switch, worker_ip, worker_mac, raw_spine_port, raw_leaf_port = parts
     return WorkerPlacement(
         worker_id=worker_id,
         leaf_switch=leaf_switch,
         worker_ip=worker_ip,
+        worker_mac=worker_mac,
         spine_port=int(raw_spine_port),
         leaf_port=int(raw_leaf_port),
     )
@@ -64,6 +73,7 @@ class WorkerPlacement:
     worker_id: str
     leaf_switch: str
     worker_ip: str
+    worker_mac: str
     spine_port: int
     leaf_port: int
 
@@ -106,45 +116,6 @@ class CacheSyncEvent:
         )
 
 
-class SwitchWriter(Protocol):
-    """Applies control-plane commands to a logical switch target."""
-
-    def apply(self, switch_name: str, commands: list[str]) -> None: ...
-
-
-@dataclass
-class InMemorySwitchWriter:
-    """Test writer that records the commands sent to each switch."""
-
-    commands_by_switch: dict[str, list[str]] = field(
-        default_factory=lambda: defaultdict(list)
-    )
-
-    def apply(self, switch_name: str, commands: list[str]) -> None:
-        self.commands_by_switch[switch_name].extend(commands)
-
-
-@dataclass
-class BMv2CLIWriter:
-    """Optional BMv2 CLI writer for prototype deployments."""
-
-    cli_by_switch: dict[str, str]
-    history: dict[str, list[str]] = field(default_factory=lambda: defaultdict(list))
-
-    def apply(self, switch_name: str, commands: list[str]) -> None:
-        self.history[switch_name].extend(commands)
-        cli = self.cli_by_switch.get(switch_name)
-        if cli is None or not commands:
-            return
-        subprocess.run(
-            [cli],
-            input="\n".join(commands) + "\n",
-            text=True,
-            capture_output=True,
-            check=True,
-        )
-
-
 class SDNController:
     """KVSwitch control plane with cache-event-driven table synchronization."""
 
@@ -159,11 +130,13 @@ class SDNController:
         max_leaf_entries: int = 1024,
         alpha: float = 1.0,
         beta: float = 1.0,
-        writer: SwitchWriter | None = None,
+        adapter: SwitchAdapter | None = None,
+        spine_switch: str = "s1",
     ) -> None:
         self._workers = {worker.worker_id: worker for worker in workers}
         self._server = UDPServer(host=host, port=port, handler=self._handle)
-        self._writer = writer or InMemorySwitchWriter()
+        self._adapter: SwitchAdapter = adapter or InMemorySwitchAdapter()
+        self._spine_switch = spine_switch
         self.alpha = alpha
         self.beta = beta
 
@@ -220,23 +193,38 @@ class SDNController:
             return UDPResponse(data={"error": f"unknown endpoint: {endpoint}"})
 
         event = CacheSyncEvent.from_payload(request.data)
-        commands = self.handle_event(event)
-        return UDPResponse(data={"status": "ok", "commands": commands})
+        logger.info("Received cache event: %s", self._describe_event(event))
+        ops = self.handle_event(event)
+        return UDPResponse(data={"status": "ok", "n_ops": len(ops)})
 
-    def handle_event(self, event: CacheSyncEvent) -> list[str]:
+    @staticmethod
+    def _describe_event(event: CacheSyncEvent) -> str:
+        details = [f"type={event.event_type}", f"worker={event.worker_id}"]
+        if event.prefix_hashes:
+            details.append(f"prefix={format_prefix_key(event.prefix_hashes)}")
+        if event.queue_depth is not None:
+            details.append(f"queue_depth={event.queue_depth}")
+        return ", ".join(details)
+
+    def handle_event(self, event: CacheSyncEvent) -> list[SwitchOp]:
         now = time.time() if event.timestamp is None else event.timestamp
         if event.worker_id not in self._workers:
             raise ValueError(f"unknown worker: {event.worker_id}")
 
-        commands: list[str] = []
+        ops: list[SwitchOp] = []
         if event.event_type == "queue_update":
             if event.queue_depth is None:
                 raise ValueError("queue_update requires queue_depth")
             self.queue_depths[event.worker_id] = event.queue_depth
             # Queue updates can change both installed rule targets and ECMP weights.
-            commands.extend(self._reconcile_all_rules(now))
-            commands.extend(self._refresh_ecmp_weights())
-            return commands
+            logger.info(
+                "Updated queue depth for %s to %d",
+                event.worker_id,
+                event.queue_depth,
+            )
+            ops.extend(self._reconcile_all_rules(now))
+            ops.extend(self._refresh_ecmp_weights())
+            return ops
 
         if not event.prefix_hashes:
             raise ValueError(f"{event.event_type} requires prefix_hashes")
@@ -249,16 +237,16 @@ class SDNController:
             self._leaf_locations[leaf_key].add(event.worker_id)
             spine_hits = self.spine_tcam.record_observation(spine_key, now)
             leaf_hits = self.leaf_tcam.record_observation(leaf_key, now)
-            commands.extend(self._maybe_install_spine_rule(spine_key, spine_hits, now))
-            commands.extend(self._maybe_install_leaf_rule(leaf_key, leaf_hits, now))
-            return commands
+            ops.extend(self._maybe_install_spine_rule(spine_key, spine_hits, now))
+            ops.extend(self._maybe_install_leaf_rule(leaf_key, leaf_hits, now))
+            return ops
 
         if event.event_type == "evict":
             # Drop stale placements and reinstall a fallback only if replicas remain.
-            commands.extend(self._apply_spine_eviction(spine_key, event.worker_id, now))
-            commands.extend(self._apply_leaf_eviction(leaf_key, event.worker_id, now))
-            commands.extend(self._refresh_ecmp_weights())
-            return commands
+            ops.extend(self._apply_spine_eviction(spine_key, event.worker_id, now))
+            ops.extend(self._apply_leaf_eviction(leaf_key, event.worker_id, now))
+            ops.extend(self._refresh_ecmp_weights())
+            return ops
 
         raise ValueError(f"unsupported event type: {event.event_type}")
 
@@ -272,40 +260,75 @@ class SDNController:
             candidates, key=lambda worker_id: (self._worker_score(worker_id), worker_id)
         )
 
-    def _spine_command_for_worker(self, prefix: tuple[int, ...], worker_id: str) -> str:
+    def _spine_add_op(self, prefix: tuple[int, ...], worker_id: str) -> TableAddOp:
         worker = self._workers[worker_id]
         h0 = prefix[0]
-        return (
-            "table_add spine_prefix_route route_to_pod "
-            f"0x{h0:08x}&&&0xffffffff => {worker.spine_port}"
+        return TableAddOp(
+            switch=self._spine_switch,
+            table="spine_prefix_route",
+            action="route_to_pod",
+            match={"hdr.kvswitch.h0": f"0x{h0:08x}&&&0xffffffff"},
+            action_params={"port": worker.spine_port},
+            priority=1,
         )
 
-    def _leaf_command_for_worker(
-        self, prefix: PrefixKey, worker_id: str
-    ) -> tuple[str, str]:
+    @staticmethod
+    def _mac_int(mac: str) -> int:
+        return int(mac.replace(":", ""), 16)
+
+    def _leaf_add_op(self, prefix: PrefixKey, worker_id: str) -> tuple[str, TableAddOp]:
         worker = self._workers[worker_id]
-        values = [0, 0, 0]
-        masks = [0, 0, 0]
-        for idx, value in enumerate(prefix):
-            values[idx] = value
-            masks[idx] = 0xFFFFFFFF
-        match = " ".join(
-            f"0x{value:08x}&&&0x{mask:08x}" for value, mask in zip(values, masks)
-        )
+        match: dict[str, str | int] = {}
+        for idx, field_name in enumerate(
+            ("hdr.kvswitch.h0", "hdr.kvswitch.h1", "hdr.kvswitch.h2")
+        ):
+            value = prefix[idx] if idx < len(prefix) else 0
+            mask = 0xFFFFFFFF if idx < len(prefix) else 0
+            match[field_name] = f"0x{value:08x}&&&0x{mask:08x}"
         return (
             worker.leaf_switch,
-            f"table_add leaf_prefix_route route_to_worker {match} => {worker.leaf_port}",
+            TableAddOp(
+                switch=worker.leaf_switch,
+                table="leaf_prefix_route",
+                action="route_to_worker",
+                match=match,
+                action_params={
+                    "port": worker.leaf_port,
+                    "dst_mac": self._mac_int(worker.worker_mac),
+                },
+                priority=1,
+            ),
         )
 
-    def _delete_spine_command(self, prefix: tuple[int, ...]) -> str:
-        return f"table_delete spine_prefix_route 0x{prefix[0]:08x}"
+    def _spine_delete_op(self, prefix: tuple[int, ...]) -> TableDeleteOp:
+        h0 = prefix[0]
+        return TableDeleteOp(
+            switch=self._spine_switch,
+            table="spine_prefix_route",
+            match={"hdr.kvswitch.h0": f"0x{h0:08x}&&&0xffffffff"},
+            priority=1,
+        )
 
-    def _delete_leaf_command(
+    def _leaf_delete_op(
         self, prefix: PrefixKey, worker_id: str
-    ) -> tuple[str, str]:
-        switch = self._workers[worker_id].leaf_switch
-        match = ".".join(f"{value:08x}" for value in prefix)
-        return switch, f"table_delete leaf_prefix_route {match}"
+    ) -> tuple[str, TableDeleteOp]:
+        worker = self._workers[worker_id]
+        match: dict[str, str | int] = {}
+        for idx, field_name in enumerate(
+            ("hdr.kvswitch.h0", "hdr.kvswitch.h1", "hdr.kvswitch.h2")
+        ):
+            value = prefix[idx] if idx < len(prefix) else 0
+            mask = 0xFFFFFFFF if idx < len(prefix) else 0
+            match[field_name] = f"0x{value:08x}&&&0x{mask:08x}"
+        return (
+            worker.leaf_switch,
+            TableDeleteOp(
+                switch=worker.leaf_switch,
+                table="leaf_prefix_route",
+                match=match,
+                priority=1,
+            ),
+        )
 
     def _leaf_switch_for_prefix(self, prefix: PrefixKey) -> str:
         candidates = self._leaf_locations.get(prefix)
@@ -319,7 +342,7 @@ class SDNController:
         prefix: tuple[int, ...],
         hit_count: int,
         now: float,
-    ) -> list[str]:
+    ) -> list[SwitchOp]:
         # Spine rules coarse-route by the first exported hash only.
         if not self.spine_tcam.admitted(prefix, now):
             return []
@@ -330,19 +353,31 @@ class SDNController:
         _, evicted = self.spine_tcam.install(
             prefix, worker_id, hit_count=hit_count, now=now
         )
-        commands: list[str] = []
+        ops: list[SwitchOp] = []
         if evicted is not None:
-            commands.append(self._delete_spine_command(evicted[0]))
-        commands.append(self._spine_command_for_worker(prefix, worker_id))
-        self._writer.apply("spine", commands)
-        return commands
+            ops.append(self._spine_delete_op(evicted[0]))
+            logger.info(
+                "Evicting spine prefix rule prefix=%s previous_worker=%s",
+                format_prefix_key(evicted[0]),
+                evicted[1].target_id,
+            )
+        add_op = self._spine_add_op(prefix, worker_id)
+        ops.append(add_op)
+        logger.info(
+            "Installing spine prefix rule prefix=%s worker=%s switch=%s",
+            format_prefix_key(prefix),
+            worker_id,
+            self._spine_switch,
+        )
+        self._adapter.apply_ops(ops)
+        return ops
 
     def _maybe_install_leaf_rule(
         self,
         prefix: PrefixKey,
         hit_count: int,
         now: float,
-    ) -> list[str]:
+    ) -> list[SwitchOp]:
         # Leaf rules refine the decision with as many exported hashes as we have.
         if not self.leaf_tcam.admitted(prefix, now):
             return []
@@ -353,24 +388,36 @@ class SDNController:
         rule, evicted = self.leaf_tcam.install(
             prefix, worker_id, hit_count=hit_count, now=now
         )
-        switch_name, command = self._leaf_command_for_worker(prefix, worker_id)
-        commands: list[str] = []
+        switch_name, add_op = self._leaf_add_op(prefix, worker_id)
+        ops: list[SwitchOp] = []
         if evicted is not None:
-            evicted_switch, evicted_cmd = self._delete_leaf_command(
+            evicted_switch, evict_op = self._leaf_delete_op(
                 evicted[0], evicted[1].target_id
             )
-            self._writer.apply(evicted_switch, [evicted_cmd])
-            commands.append(evicted_cmd)
-        commands.append(command)
-        self._writer.apply(switch_name, [command])
-        return commands
+            self._adapter.apply_ops([evict_op])
+            logger.info(
+                "Evicting leaf prefix rule prefix=%s previous_worker=%s switch=%s",
+                format_prefix_key(evicted[0]),
+                evicted[1].target_id,
+                evicted_switch,
+            )
+            ops.append(evict_op)
+        ops.append(add_op)
+        logger.info(
+            "Installing leaf prefix rule prefix=%s worker=%s switch=%s",
+            format_prefix_key(prefix),
+            worker_id,
+            switch_name,
+        )
+        self._adapter.apply_ops([add_op])
+        return ops
 
     def _apply_spine_eviction(
         self,
         prefix: tuple[int, ...],
         worker_id: str,
         now: float,
-    ) -> list[str]:
+    ) -> list[SwitchOp]:
         candidates = self._spine_locations.get(prefix)
         if not candidates:
             return []
@@ -381,16 +428,21 @@ class SDNController:
         self._spine_locations.pop(prefix, None)
         if self.spine_tcam.remove(prefix) is None:
             return []
-        commands = [self._delete_spine_command(prefix)]
-        self._writer.apply("spine", commands)
-        return commands
+        op = self._spine_delete_op(prefix)
+        logger.info(
+            "Removing spine prefix rule prefix=%s switch=%s",
+            format_prefix_key(prefix),
+            self._spine_switch,
+        )
+        self._adapter.apply_ops([op])
+        return [op]
 
     def _apply_leaf_eviction(
         self,
         prefix: PrefixKey,
         worker_id: str,
         now: float,
-    ) -> list[str]:
+    ) -> list[SwitchOp]:
         candidates = self._leaf_locations.get(prefix)
         if not candidates:
             return []
@@ -402,33 +454,39 @@ class SDNController:
         removed = self.leaf_tcam.remove(prefix)
         if removed is None:
             return []
-        switch_name, command = self._delete_leaf_command(prefix, removed.target_id)
-        self._writer.apply(switch_name, [command])
-        return [command]
+        switch_name, op = self._leaf_delete_op(prefix, removed.target_id)
+        logger.info(
+            "Removing leaf prefix rule prefix=%s worker=%s switch=%s",
+            format_prefix_key(prefix),
+            removed.target_id,
+            switch_name,
+        )
+        self._adapter.apply_ops([op])
+        return [op]
 
-    def _reconcile_all_rules(self, now: float) -> list[str]:
-        commands: list[str] = []
+    def _reconcile_all_rules(self, now: float) -> list[SwitchOp]:
+        ops: list[SwitchOp] = []
         # Queue shifts can change the best worker for already-admitted prefixes.
         for prefix in list(self.spine_tcam._installed.keys()):
             candidates = self._spine_locations.get(prefix, set())
             if not candidates:
                 continue
             hit_count = self.spine_tcam.observation_count(prefix, now)
-            commands.extend(self._maybe_install_spine_rule(prefix, hit_count, now))
+            ops.extend(self._maybe_install_spine_rule(prefix, hit_count, now))
 
         for prefix in list(self.leaf_tcam._installed.keys()):
             candidates = self._leaf_locations.get(prefix, set())
             if not candidates:
                 continue
             hit_count = self.leaf_tcam.observation_count(prefix, now)
-            commands.extend(self._maybe_install_leaf_rule(prefix, hit_count, now))
-        return commands
+            ops.extend(self._maybe_install_leaf_rule(prefix, hit_count, now))
+        return ops
 
-    def _refresh_ecmp_weights(self) -> list[str]:
-        commands: list[str] = []
-        commands.extend(self._program_spine_ecmp())
-        commands.extend(self._program_leaf_ecmp())
-        return commands
+    def _refresh_ecmp_weights(self) -> list[SwitchOp]:
+        ops: list[SwitchOp] = []
+        ops.extend(self._program_spine_ecmp())
+        ops.extend(self._program_leaf_ecmp())
+        return ops
 
     def _inverse_queue_weight(self, worker_id: str) -> float:
         return 1.0 / (1.0 + float(self.queue_depths.get(worker_id, 0)))
@@ -466,26 +524,34 @@ class SDNController:
                 bucket += 1
         return mapping
 
-    def _program_spine_ecmp(self) -> list[str]:
+    def _program_spine_ecmp(self) -> list[SwitchOp]:
         # Misses are balanced at the pod level before leaf-level selection.
         per_leaf: dict[str, float] = defaultdict(float)
         for worker_id, placement in self._workers.items():
             per_leaf[placement.leaf_switch] += self._inverse_queue_weight(worker_id)
         bucket_map = self._allocate_buckets(per_leaf)
-        commands = ["table_clear spine_ecmp_select"]
         leaves = {
             placement.leaf_switch: placement.spine_port
             for placement in self._workers.values()
         }
+        ops: list[SwitchOp] = [
+            TableClearOp(switch=self._spine_switch, table="spine_ecmp_select")
+        ]
         for bucket, leaf_switch in bucket_map.items():
-            commands.append(
-                f"table_add spine_ecmp_select route_to_pod {bucket} => {leaves[leaf_switch]}"
+            ops.append(
+                TableAddOp(
+                    switch=self._spine_switch,
+                    table="spine_ecmp_select",
+                    action="route_to_pod",
+                    match={"meta.ecmp_bucket": bucket},
+                    action_params={"port": leaves[leaf_switch]},
+                )
             )
-        self._writer.apply("spine", commands)
-        return commands
+        self._adapter.apply_ops(ops)
+        return ops
 
-    def _program_leaf_ecmp(self) -> list[str]:
-        commands: list[str] = []
+    def _program_leaf_ecmp(self) -> list[SwitchOp]:
+        all_ops: list[SwitchOp] = []
         # Each leaf rebalances only across its directly attached workers.
         workers_by_leaf: dict[str, dict[str, float]] = defaultdict(dict)
         for worker_id, placement in self._workers.items():
@@ -495,14 +561,26 @@ class SDNController:
 
         for leaf_switch, weights in workers_by_leaf.items():
             bucket_map = self._allocate_buckets(weights)
-            leaf_commands = ["table_clear leaf_ecmp_select"]
+            ops: list[SwitchOp] = [
+                TableClearOp(switch=leaf_switch, table="leaf_ecmp_select")
+            ]
             for bucket, worker_id in bucket_map.items():
-                leaf_commands.append(
-                    f"table_add leaf_ecmp_select route_to_worker {bucket} => {self._workers[worker_id].leaf_port}"
+                worker = self._workers[worker_id]
+                ops.append(
+                    TableAddOp(
+                        switch=leaf_switch,
+                        table="leaf_ecmp_select",
+                        action="route_to_worker",
+                        match={"meta.ecmp_bucket": bucket},
+                        action_params={
+                            "port": worker.leaf_port,
+                            "dst_mac": self._mac_int(worker.worker_mac),
+                        },
+                    )
                 )
-            self._writer.apply(leaf_switch, leaf_commands)
-            commands.extend(leaf_commands)
-        return commands
+            self._adapter.apply_ops(ops)
+            all_ops.extend(ops)
+        return all_ops
 
     async def run_forever(self) -> None:
         await self.start()

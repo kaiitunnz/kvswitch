@@ -20,8 +20,9 @@ control KVSwitchIngress(
         standard_metadata.egress_spec = port;
     }
 
-    action route_to_worker(bit<9> port) {
+    action route_to_worker(bit<9> port, bit<48> dst_mac) {
         standard_metadata.egress_spec = port;
+        hdr.ethernet.dstAddr = dst_mac;
     }
 
     action drop() {

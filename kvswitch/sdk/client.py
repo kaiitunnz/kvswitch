@@ -66,7 +66,7 @@ class KVSwitchUDPClient:
 
         transport, _ = await loop.create_datagram_endpoint(
             _Protocol,
-            remote_addr=(self.host, self.port),
+            local_addr=("0.0.0.0", 0),
         )
         try:
             hashes = prefix_hashes or []
@@ -74,7 +74,7 @@ class KVSwitchUDPClient:
             shim_bytes = shim.encode()
 
             json_bytes = json.dumps(data).encode("utf-8")
-            transport.sendto(shim_bytes + json_bytes)
+            transport.sendto(shim_bytes + json_bytes, (self.host, self.port))
 
             response_bytes = await asyncio.wait_for(future, timeout=self.timeout)
 

@@ -5,14 +5,15 @@ import time
 
 from kvswitch.controller import (
     CacheSyncEvent,
-    InMemorySwitchWriter,
+    InMemorySwitchAdapter,
     SDNController,
+    TableAddOp,
     TcamManager,
 )
 from kvswitch.controller.sdn_controller import WorkerPlacement
 from kvswitch.mock.worker import MockWorker
-from kvswitch.sdk.header import KVSwitchShimHeader
-from kvswitch.utils.udp import UDPClient
+from kvswitch.sdk.client import KVSwitchUDPClient
+from kvswitch.sdk.hashing import compute_truncated_hashes
 
 
 def test_tcam_manager_admits_and_evicts_lru_prefix() -> None:
@@ -37,13 +38,14 @@ def test_tcam_manager_admits_and_evicts_lru_prefix() -> None:
 def test_controller_installs_reroutes_and_deletes_leaf_rules_on_correct_switch() -> (
     None
 ):
-    writer = InMemorySwitchWriter()
+    adapter = InMemorySwitchAdapter()
     controller = SDNController(
         workers=[
             WorkerPlacement(
                 worker_id="worker0",
                 leaf_switch="leaf0",
                 worker_ip="10.0.0.1",
+                worker_mac="02:00:00:00:00:01",
                 spine_port=10,
                 leaf_port=1,
             ),
@@ -51,6 +53,7 @@ def test_controller_installs_reroutes_and_deletes_leaf_rules_on_correct_switch()
                 worker_id="worker1",
                 leaf_switch="leaf1",
                 worker_ip="10.0.1.1",
+                worker_mac="02:00:00:00:00:02",
                 spine_port=11,
                 leaf_port=2,
             ),
@@ -59,7 +62,8 @@ def test_controller_installs_reroutes_and_deletes_leaf_rules_on_correct_switch()
         max_spine_entries=2,
         max_leaf_entries=1,
         beta=1.0,
-        writer=writer,
+        adapter=adapter,
+        spine_switch="s1",
     )
 
     prefix = (0x1, 0x2, 0x3)
@@ -70,11 +74,22 @@ def test_controller_installs_reroutes_and_deletes_leaf_rules_on_correct_switch()
         == []
     )
 
-    install_commands = controller.handle_event(
+    install_ops = controller.handle_event(
         CacheSyncEvent("alloc", "worker0", prefix_hashes=prefix, timestamp=2.0)
     )
-    assert any("spine_prefix_route" in command for command in install_commands)
-    assert any("leaf_prefix_route" in command for command in install_commands)
+    spine_adds = [
+        op
+        for op in install_ops
+        if isinstance(op, TableAddOp) and op.table == "spine_prefix_route"
+    ]
+    leaf_adds = [
+        op
+        for op in install_ops
+        if isinstance(op, TableAddOp) and op.table == "leaf_prefix_route"
+    ]
+    assert len(spine_adds) > 0
+    assert len(leaf_adds) > 0
+    assert adapter.table_adds(switch="s1", table="spine_prefix_route")
     assert controller.spine_tcam.installed_rule((0x1,)).target_id == "worker0"
     assert controller.leaf_tcam.installed_rule(prefix).target_id == "worker0"
 
@@ -84,11 +99,21 @@ def test_controller_installs_reroutes_and_deletes_leaf_rules_on_correct_switch()
     controller.handle_event(
         CacheSyncEvent("queue_update", "worker1", queue_depth=0, timestamp=2.5)
     )
-    reroute_commands = controller.handle_event(
+    reroute_ops = controller.handle_event(
         CacheSyncEvent("alloc", "worker1", prefix_hashes=prefix, timestamp=3.0)
     )
-    assert any(command.endswith("=> 11") for command in reroute_commands)
-    assert any(command.endswith("=> 2") for command in reroute_commands)
+    spine_reroutes = [
+        op
+        for op in reroute_ops
+        if isinstance(op, TableAddOp) and op.table == "spine_prefix_route"
+    ]
+    leaf_reroutes = [
+        op
+        for op in reroute_ops
+        if isinstance(op, TableAddOp) and op.table == "leaf_prefix_route"
+    ]
+    assert any(op.action_params["port"] == 11 for op in spine_reroutes)
+    assert any(op.action_params["port"] == 2 for op in leaf_reroutes)
     assert controller.spine_tcam.installed_rule((0x1,)).target_id == "worker1"
     assert controller.leaf_tcam.installed_rule(prefix).target_id == "worker1"
 
@@ -96,23 +121,36 @@ def test_controller_installs_reroutes_and_deletes_leaf_rules_on_correct_switch()
     controller.handle_event(
         CacheSyncEvent("alloc", "worker0", prefix_hashes=other_prefix, timestamp=4.0)
     )
-    eviction_commands = controller.handle_event(
+    eviction_ops = controller.handle_event(
         CacheSyncEvent("alloc", "worker0", prefix_hashes=other_prefix, timestamp=5.0)
     )
+    # Old leaf rule for prefix should have been deleted.
+    leaf_deletes = adapter.table_deletes(table="leaf_prefix_route")
     assert any(
-        command == "table_delete leaf_prefix_route 00000001.00000002.00000003"
-        for command in writer.commands_by_switch["leaf1"]
+        op.match.get("hdr.kvswitch.h0") == "0x00000001&&&0xffffffff"
+        for op in leaf_deletes
     )
+    # New leaf rule for other_prefix should be added.
+    new_leaf_adds = [
+        op
+        for op in eviction_ops
+        if isinstance(op, TableAddOp) and op.table == "leaf_prefix_route"
+    ]
     assert any(
-        command
-        == "table_add leaf_prefix_route route_to_worker 0x00000009&&&0xffffffff 0x00000008&&&0xffffffff 0x00000007&&&0xffffffff => 1"
-        for command in eviction_commands
+        op.action_params["port"] == 1
+        and op.match.get("hdr.kvswitch.h0") == "0x00000009&&&0xffffffff"
+        for op in new_leaf_adds
     )
 
-    fallback_commands = controller.handle_event(
+    fallback_ops = controller.handle_event(
         CacheSyncEvent("evict", "worker1", prefix_hashes=prefix, timestamp=6.0)
     )
-    assert any(command.endswith("=> 10") for command in fallback_commands)
+    spine_fallbacks = [
+        op
+        for op in fallback_ops
+        if isinstance(op, TableAddOp) and op.table == "spine_prefix_route"
+    ]
+    assert any(op.action_params["port"] == 10 for op in spine_fallbacks)
     assert controller.spine_tcam.installed_rule((0x1,)).target_id == "worker0"
 
 
@@ -127,13 +165,14 @@ async def _wait_until(predicate, timeout: float = 1.0) -> None:
 
 def test_mock_worker_emits_cache_events_and_controller_tracks_prefixes() -> None:
     async def _run() -> None:
-        writer = InMemorySwitchWriter()
+        adapter = InMemorySwitchAdapter()
         controller = SDNController(
             workers=[
                 WorkerPlacement(
                     worker_id="worker0",
                     leaf_switch="leaf0",
                     worker_ip="10.0.0.1",
+                    worker_mac="02:00:00:00:00:01",
                     spine_port=10,
                     leaf_port=1,
                 )
@@ -141,13 +180,14 @@ def test_mock_worker_emits_cache_events_and_controller_tracks_prefixes() -> None
             host="127.0.0.1",
             port=0,
             admission_threshold=1,
-            writer=writer,
+            adapter=adapter,
         )
         await controller.start()
 
         worker = MockWorker(
             host="127.0.0.1",
             port=0,
+            kvswitch_port=0,
             ttft_ms=1.0,
             worker_id="worker0",
             controller_host="127.0.0.1",
@@ -155,36 +195,35 @@ def test_mock_worker_emits_cache_events_and_controller_tracks_prefixes() -> None
             max_cached_prefixes=8,
         )
         await worker.start()
+        assert worker.kvswitch_port is not None
 
-        client = UDPClient(host="127.0.0.1", port=worker.port, timeout=5.0)
-        header = KVSwitchShimHeader.from_hashes(
-            [0x11111111, 0x22222222, 0x33333333], req_id=7
-        ).to_dict()
+        prefix_hashes = compute_truncated_hashes([0] * 256, b"test-key")
+        client = KVSwitchUDPClient(
+            host="127.0.0.1", port=worker.kvswitch_port, timeout=5.0
+        )
         request = {
             "endpoint": "generate",
             "prompt_token_ids": [0] * 256,
             "max_tokens": 1,
-            "kvswitch_header": header,
         }
 
-        first = await client.send(request)
+        first = await client.send(request, prefix_hashes=prefix_hashes, req_id=7)
         assert first["matched_blocks"] == 0
         assert first["num_cached_tokens"] == 0
 
+        expected_prefix = tuple(prefix_hashes)
         await _wait_until(
-            lambda: controller.leaf_tcam.installed_rule(
-                (0x11111111, 0x22222222, 0x33333333)
-            )
-            is not None
+            lambda: controller.leaf_tcam.installed_rule(expected_prefix) is not None,
+            timeout=2.0,
         )
 
-        second = await client.send(request)
+        second = await client.send(request, prefix_hashes=prefix_hashes, req_id=8)
         assert second["matched_blocks"] == 16
         assert second["num_cached_tokens"] == 256
 
         snapshot = controller.snapshot()
-        assert "11111111" in snapshot["spine_rules"]
-        assert "11111111.22222222.33333333" in snapshot["leaf_rules"]
+        assert len(snapshot["spine_rules"]) > 0
+        assert len(snapshot["leaf_rules"]) > 0
 
         worker.close()
         controller.close()

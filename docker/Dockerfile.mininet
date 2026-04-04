@@ -1,13 +1,18 @@
 # Stage 1: Extract BMv2 binaries + libraries from p4c image.
 FROM p4c:latest AS p4-tools
 
-# Collect simple_switch, simple_switch_CLI, and all non-standard shared
-# libraries they depend on into /p4-export/.
-RUN mkdir -p /p4-export/bin /p4-export/lib /p4-export/py && \
+# Collect simple_switch, simple_switch_CLI, BMv2 runtime plugin directories,
+# and all non-standard shared libraries they depend on into /p4-export/.
+RUN mkdir -p /p4-export/bin /p4-export/lib /p4-export/py \
+        /p4-export/usr-local-lib/libyang /p4-export/etc/sysrepo/yang && \
     cp /usr/local/bin/simple_switch /p4-export/bin/ && \
+    cp /usr/local/bin/simple_switch_grpc /p4-export/bin/ && \
     cp /usr/local/bin/simple_switch_CLI /p4-export/bin/ && \
     # Copy /usr/local/lib shared objects needed by simple_switch.
     cp /usr/local/lib/lib*.so* /p4-export/lib/ && \
+    cp -r /usr/local/lib/libyang/extensions /p4-export/usr-local-lib/libyang/ && \
+    cp -r /usr/local/lib/libyang/user_types /p4-export/usr-local-lib/libyang/ && \
+    cp -r /etc/sysrepo/yang/internal /p4-export/etc/sysrepo/yang/ && \
     # Copy non-glibc system libs that differ between Ubuntu 20.04 and 22.04.
     for lib in \
         /lib/x86_64-linux-gnu/libboost_program_options.so* \
@@ -17,6 +22,13 @@ RUN mkdir -p /p4-export/bin /p4-export/lib /p4-export/py && \
         /lib/x86_64-linux-gnu/libgmp.so* \
         /lib/x86_64-linux-gnu/libssl.so.1.1 \
         /lib/x86_64-linux-gnu/libcrypto.so.1.1 \
+        /lib/x86_64-linux-gnu/libprotobuf-c.so* \
+        /lib/x86_64-linux-gnu/libev.so* \
+        /usr/lib/x86_64-linux-gnu/libprotobuf-c.so* \
+        /usr/lib/x86_64-linux-gnu/libev.so* \
+        /usr/lib/x86_64-linux-gnu/libpcre.so* \
+        /usr/lib/x86_64-linux-gnu/libz.so* \
+        /usr/lib/libavl.so* \
     ; do cp "$lib" /p4-export/lib/ 2>/dev/null || true; done && \
     # Copy Python modules needed by simple_switch_CLI.
     cp /usr/local/lib/python3.8/site-packages/sswitch_CLI.py /p4-export/py/ && \
@@ -37,9 +49,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates ethtool git \
     && rm -rf /var/lib/apt/lists/*
 
-# BMv2 binaries + shared libraries + Python CLI modules from Stage 1.
+# BMv2 binaries + shared libraries + plugin directories + Python CLI modules
+# from Stage 1.
 COPY --from=p4-tools /p4-export/bin/ /usr/local/bin/
 COPY --from=p4-tools /p4-export/lib/ /usr/local/lib/
+COPY --from=p4-tools /p4-export/usr-local-lib/libyang/ /usr/local/lib/libyang/
+COPY --from=p4-tools /p4-export/etc/sysrepo/yang/ /etc/sysrepo/yang/
 # simple_switch_CLI hardcodes /usr/local/lib/python3.8/site-packages, so
 # install its Python support files at that exact path in the runtime image.
 COPY --from=p4-tools /p4-export/py/ /usr/local/lib/python3.8/site-packages/

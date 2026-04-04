@@ -26,6 +26,12 @@ echo "  Args: $*"
 echo ""
 
 HF_CACHE="${HF_HOME:-${HOME}/.cache/huggingface}"
+P4_BUILD_DIR="$ROOT/build/p4/kvswitch"
+
+if [[ ! -f "$P4_BUILD_DIR/kvswitch.json" || ! -f "$P4_BUILD_DIR/kvswitch.p4info.txtpb" ]]; then
+    echo "Compiling P4 artifacts into $P4_BUILD_DIR ..."
+    bash "$ROOT/scripts/compile_p4.sh" p4/kvswitch.p4 build/p4/kvswitch
+fi
 
 docker run --rm --privileged \
     -e HF_HOME=/root/.cache/huggingface \

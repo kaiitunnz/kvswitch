@@ -26,6 +26,8 @@ logger = logging.getLogger(__name__)
 CLIENT_IP = "10.0.0.100"
 ROUTER_IP = "10.0.0.200"
 CONTROLLER_IP = "10.0.0.201"
+KVSWITCH_SERVICE_IP = "10.0.0.250"
+KVSWITCH_SERVICE_MAC = "02:00:00:00:00:fa"
 
 
 def worker_ip(idx: int) -> str:
