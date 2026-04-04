@@ -35,6 +35,18 @@ from kvswitch.sdk.client import KVSwitchUDPClient
 from kvswitch.utils.udp import UDPClient
 
 
+def _estimate_ttft_ms(e2e_ms: float, response: dict[str, Any]) -> float | None:
+    """Estimate client-side TTFT from worker simulation plus residual latency."""
+    raw_simulated_ttft_ms = response.get("simulated_ttft_ms")
+    raw_simulated_e2e_ms = response.get("simulated_e2e_ms")
+    if raw_simulated_ttft_ms is None and raw_simulated_e2e_ms is None:
+        return None
+
+    simulated_ttft_ms = float(raw_simulated_ttft_ms or 0.0)
+    simulated_e2e_ms = float(raw_simulated_e2e_ms or 0.0)
+    return simulated_ttft_ms + max(e2e_ms - simulated_e2e_ms, 0.0)
+
+
 async def _send_one(
     request: dict,
     host: str,
@@ -69,10 +81,12 @@ async def _send_one(
     except Exception as exc:
         resp = {"error": str(exc)}
     e2e_ms = (time.perf_counter() - start) * 1000
+    ttft_ms = _estimate_ttft_ms(e2e_ms, resp)
 
     return {
         "request_id": request["request_id"],
         "e2e_latency_ms": e2e_ms,
+        "ttft_ms": ttft_ms,
         "actual_send_time_s": actual_send,
         "scheduled_time_s": request.get("scheduled_time", 0.0),
         "prefix_group": request.get("prefix_group", "none"),

@@ -401,6 +401,7 @@ def _to_request_metrics(raw: list[dict], baseline: str) -> list[RequestMetric]:
                 request_id=r.get("request_id", 0),
                 baseline=baseline,
                 e2e_latency_ms=r.get("e2e_latency_ms", 0.0),
+                ttft_ms=r.get("ttft_ms", 0.0) or 0.0,
                 simulated_ttft_ms=r.get("simulated_ttft_ms", 0.0) or 0.0,
                 simulated_tpot_ms=r.get("simulated_tpot_ms", 0.0) or 0.0,
                 simulated_e2e_ms=r.get("simulated_e2e_ms", 0.0) or 0.0,
@@ -885,10 +886,12 @@ def main() -> None:
             all_results[baseline] = metrics
             summary = compute_summary(metrics)
             logger.info(
-                "%s: e2e_p50=%.1fms e2e_p95=%.1fms cache_hit=%.2f",
+                "%s: e2e_p50=%.1fms e2e_p95=%.1fms ttft_p50=%.1fms ttft_p95=%.1fms cache_hit=%.2f",
                 baseline,
                 summary.get("e2e_p50_ms", 0),
                 summary.get("e2e_p95_ms", 0),
+                summary.get("ttft_p50_ms", 0),
+                summary.get("ttft_p95_ms", 0),
                 summary.get("cache_hit_rate_mean", 0),
             )
         except Exception:

@@ -16,6 +16,7 @@ class RequestMetric:
     request_id: int
     baseline: str  # "l4_rr", "l7", "kvswitch"
     e2e_latency_ms: float  # Client-measured RTT
+    ttft_ms: float  # Client-side TTFT estimate
     simulated_ttft_ms: float  # From mock worker response
     simulated_tpot_ms: float  # From mock worker response
     simulated_e2e_ms: float  # From mock worker response
@@ -45,14 +46,14 @@ def _percentile(values: list[float], p: float) -> float:
 def compute_summary(metrics: list[RequestMetric]) -> dict:
     """Compute aggregate statistics from a list of request metrics.
 
-    Returns a dict with P50/P95/P99 for E2E, TTFT, TPOT; mean cache hit
-    rate; mean routing overhead; and throughput.
+    Returns a dict with P50/P95/P99 for client E2E, estimated client TTFT,
+    and simulated TPOT; mean cache hit rate; mean routing overhead; and throughput.
     """
     if not metrics:
         return {}
 
     e2e = [m.e2e_latency_ms for m in metrics]
-    ttft = [m.simulated_ttft_ms for m in metrics]
+    ttft = [m.ttft_ms for m in metrics]
     tpot = [m.simulated_tpot_ms for m in metrics]
     routing = [m.routing_overhead_ms for m in metrics]
     hit_rates = [

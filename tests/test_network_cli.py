@@ -4,6 +4,7 @@ import asyncio
 import json
 import time
 
+from kvswitch.eval.metrics import RequestMetric, compute_summary
 from kvswitch.mock.worker import MockWorker
 from kvswitch.network.cli.healthcheck import check_health
 from kvswitch.network.cli.healthcheck import main as healthcheck_main
@@ -11,7 +12,7 @@ from kvswitch.network.cli.measure_client import main as measure_client_main
 from kvswitch.network.cli.measure_client import (
     measure_latencies,
 )
-from kvswitch.network.cli.workload_client import _send_one
+from kvswitch.network.cli.workload_client import _estimate_ttft_ms, _send_one
 
 
 def _run_worker(coro):
@@ -77,7 +78,12 @@ class TestMeasureClientCli:
             seen["data"] = data
             seen["prefix_hashes"] = prefix_hashes
             seen["req_id"] = req_id
-            return {"worker_id": "worker0", "matched_blocks": 0}
+            return {
+                "worker_id": "worker0",
+                "matched_blocks": 0,
+                "simulated_ttft_ms": 5.0,
+                "simulated_e2e_ms": 4.0,
+            }
 
         monkeypatch.setattr("kvswitch.sdk.client.KVSwitchUDPClient.send", _fake_send)
 
@@ -107,6 +113,67 @@ class TestMeasureClientCli:
         assert seen["prefix_hashes"] == [10, 20]
         assert seen["req_id"] == 11
         assert result["worker_id"] == "worker0"
+        assert result["ttft_ms"] >= 5.0
+
+    def test_estimate_ttft_adds_non_negative_residual(self) -> None:
+        assert (
+            _estimate_ttft_ms(
+                12.0,
+                {"simulated_ttft_ms": 5.0, "simulated_e2e_ms": 9.0},
+            )
+            == 8.0
+        )
+        assert (
+            _estimate_ttft_ms(
+                7.0,
+                {"simulated_ttft_ms": 5.0, "simulated_e2e_ms": 9.0},
+            )
+            == 5.0
+        )
+        assert _estimate_ttft_ms(7.0, {"error": "timeout"}) is None
+
+    def test_compute_summary_uses_client_ttft(self) -> None:
+        metrics = [
+            RequestMetric(
+                request_id=1,
+                baseline="kvswitch",
+                e2e_latency_ms=12.0,
+                ttft_ms=8.0,
+                simulated_ttft_ms=5.0,
+                simulated_tpot_ms=2.0,
+                simulated_e2e_ms=9.0,
+                routing_overhead_ms=0.0,
+                matched_blocks=1,
+                worker_id="worker0",
+                prompt_tokens=16,
+                output_tokens=2,
+                prefix_group="group_0",
+                scheduled_time_s=0.0,
+                actual_send_time_s=0.0,
+            ),
+            RequestMetric(
+                request_id=2,
+                baseline="kvswitch",
+                e2e_latency_ms=20.0,
+                ttft_ms=11.0,
+                simulated_ttft_ms=6.0,
+                simulated_tpot_ms=3.0,
+                simulated_e2e_ms=15.0,
+                routing_overhead_ms=0.0,
+                matched_blocks=0,
+                worker_id="worker1",
+                prompt_tokens=16,
+                output_tokens=2,
+                prefix_group="group_1",
+                scheduled_time_s=0.0,
+                actual_send_time_s=1.0,
+            ),
+        ]
+
+        summary = compute_summary(metrics)
+
+        assert summary["ttft_mean_ms"] == 9.5
+        assert summary["ttft_p50_ms"] == 9.5
 
     def test_main_prints_json(self, capsys, monkeypatch) -> None:
         async def _fake_measure_latencies(
