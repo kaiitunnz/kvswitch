@@ -50,9 +50,7 @@ def parse_worker_placement(spec: str) -> "WorkerPlacement":
 def parse_worker_placements(specs: str) -> list["WorkerPlacement"]:
     """Parse ``;``-separated worker placement specs."""
     placements = [
-        parse_worker_placement(spec)
-        for spec in specs.split(";")
-        if spec.strip()
+        parse_worker_placement(spec) for spec in specs.split(";") if spec.strip()
     ]
     if not placements:
         raise ValueError("at least one worker placement is required")
