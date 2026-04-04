@@ -12,7 +12,9 @@ from kvswitch.network.cli.measure_client import main as measure_client_main
 from kvswitch.network.cli.measure_client import (
     measure_latencies,
 )
+from kvswitch.network.cli.udp_relay import UDPRelay
 from kvswitch.network.cli.workload_client import _estimate_ttft_ms, _send_one
+from kvswitch.utils.udp import UDPClient, UDPRequest, UDPResponse, UDPServer
 
 
 def _run_worker(coro):
@@ -47,6 +49,40 @@ class TestHealthcheckCli:
 
         healthcheck_main(["--host", "127.0.0.1", "--port", "8000"])
         assert capsys.readouterr().out.strip() == "ok"
+
+
+class TestUdpRelay:
+    def test_udp_relay_forwards_request_and_response(self) -> None:
+        async def _assert() -> None:
+            async def _upstream_handler(request: UDPRequest) -> UDPResponse:
+                return UDPResponse(
+                    data={
+                        "status": "ok",
+                        "endpoint": request.data.get("endpoint"),
+                        "payload": request.data.get("value"),
+                    }
+                )
+
+            upstream = UDPServer(host="127.0.0.1", port=0, handler=_upstream_handler)
+            await upstream.start()
+            relay = UDPRelay(
+                host="127.0.0.1",
+                port=0,
+                upstream_host="127.0.0.1",
+                upstream_port=upstream.port,
+                timeout=2.0,
+            )
+            await relay.start()
+            try:
+                client = UDPClient(host="127.0.0.1", port=relay.bound_port, timeout=2.0)
+                response = await client.send({"endpoint": "health", "value": 7})
+            finally:
+                relay.close()
+                upstream.close()
+
+            assert response == {"status": "ok", "endpoint": "health", "payload": 7}
+
+        asyncio.run(_assert())
 
 
 class TestMeasureClientCli:

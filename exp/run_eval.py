@@ -68,9 +68,11 @@ PYTHON = sys.executable
 WORKER_PORT = 8000
 ROUTER_PORT = 9000
 CONTROLLER_PORT = 9100
+ROOT_NS_CONTROLLER_IP = "10.0.0.254"
 
 HEALTHCHECK_MODULE = "kvswitch.network.cli.healthcheck"
 WORKLOAD_CLIENT_MODULE = "kvswitch.network.cli.workload_client"
+CONTROLLER_RELAY_MODULE = "kvswitch.network.cli.udp_relay"
 
 
 def _module_cmd(module: str, **kwargs: str | int | float) -> str:
@@ -642,15 +644,14 @@ def run_baseline_l7(
     return _to_request_metrics(raw, "l7")
 
 
-def _setup_root_ns_controller_ip(net: Mininet, controller_ip: str) -> str | None:
-    """Make ``controller_ip`` reachable from Mininet hosts by assigning it
-    to the controller host's veth interface in root namespace.
+def _setup_root_ns_controller_ip(net: Mininet, root_ns_ip: str) -> str | None:
+    """Assign a root-namespace upstream IP on the controller link.
 
-    The controller Mininet host's default interface is a veth pair.  The
-    host-side lives in the host namespace; the switch-side lives in root
-    namespace.  We add the IP as a secondary address on the switch-side
-    veth so that packets destined for ``controller_ip`` arrive in root
-    namespace (where the SDN controller process runs).
+    The Mininet ``controller`` host owns ``CONTROLLER_IP`` and receives cache
+    events from workers. A small UDP relay on that host forwards events to the
+    in-process SDN controller, which runs in root namespace. This helper assigns
+    a distinct root-namespace IP on the switch-side veth so the relay has an
+    unambiguous upstream destination.
 
     Returns the root-namespace interface name, or None on failure.
     """
@@ -669,15 +670,38 @@ def _setup_root_ns_controller_ip(net: Mininet, controller_ip: str) -> str | None
 
     # Add the controller IP to the switch-side interface in root namespace.
     subprocess.run(
-        ["ip", "addr", "add", f"{controller_ip}/32", "dev", switch_intf_name],
+        ["ip", "addr", "add", f"{root_ns_ip}/24", "dev", switch_intf_name],
         capture_output=True,
     )
     logger.info(
-        "Assigned %s to root-ns interface %s for controller reachability",
-        controller_ip,
+        "Assigned root-ns controller upstream IP %s to interface %s",
+        root_ns_ip,
         switch_intf_name,
     )
     return switch_intf_name
+
+
+def _start_controller_relay(
+    net: Mininet,
+    upstream_host: str,
+    upstream_port: int,
+) -> tuple[Node, str]:
+    """Start a UDP relay in the Mininet controller host.
+
+    Workers send cache events to ``CONTROLLER_IP`` inside Mininet. The relay
+    forwards those requests to the in-process SDN controller running in root
+    namespace at ``upstream_host:upstream_port`` and returns the response.
+    """
+    controller_host = _get_node(net, "controller")
+    relay_log = "/tmp/controller_relay.log"
+    cmd = (
+        f"{PYTHON} -m {CONTROLLER_RELAY_MODULE}"
+        f" --host {CONTROLLER_IP} --port {CONTROLLER_PORT}"
+        f" --upstream-host {upstream_host} --upstream-port {upstream_port}"
+        f" > {relay_log} 2>&1"
+    )
+    _start_bg(controller_host, cmd)
+    return controller_host, relay_log
 
 
 def run_baseline_kvswitch(
@@ -699,7 +723,7 @@ def run_baseline_kvswitch(
     # Assign the controller IP to a root-namespace interface so that
     # Mininet workers can send cache events to the controller, which
     # runs in-process (root namespace) with a FinsyWriter.
-    _setup_root_ns_controller_ip(net, CONTROLLER_IP)
+    _setup_root_ns_controller_ip(net, ROOT_NS_CONTROLLER_IP)
     _configure_kvswitch_service(net, n_workers)
 
     # Build worker placements from the live topology.
@@ -709,7 +733,7 @@ def run_baseline_kvswitch(
     # Create and start the controller in-process with the FinsyWriter.
     controller = SDNController(
         workers=worker_placements,
-        host=CONTROLLER_IP,
+        host=ROOT_NS_CONTROLLER_IP,
         port=CONTROLLER_PORT,
         adapter=adapter,
         spine_switch="s1",
@@ -717,12 +741,33 @@ def run_baseline_kvswitch(
     controller_runtime.run(controller.start())
     logger.info(
         "SDN controller running in root namespace on %s:%d",
+        ROOT_NS_CONTROLLER_IP,
+        CONTROLLER_PORT,
+    )
+
+    # Start a UDP relay in the Mininet controller host to forward cache events
+    relay_host, relay_log = _start_controller_relay(
+        net,
+        upstream_host=ROOT_NS_CONTROLLER_IP,
+        upstream_port=CONTROLLER_PORT,
+    )
+    logger.info(
+        "Started controller relay on %s:%d -> %s:%d",
         CONTROLLER_IP,
+        CONTROLLER_PORT,
+        ROOT_NS_CONTROLLER_IP,
         CONTROLLER_PORT,
     )
 
     # Start workers with controller connection and KVSwitch listener.
     client = _get_node(net, "client")
+    try:
+        _wait_for_service(client, CONTROLLER_IP, CONTROLLER_PORT, timeout=30.0)
+    except TimeoutError:
+        logger.error("Controller relay log:\n%s", relay_host.cmd(f"cat {relay_log}"))
+        controller.close()
+        raise
+
     _start_workers(
         net,
         n_workers,
@@ -736,17 +781,20 @@ def run_baseline_kvswitch(
         ttft_ms=ttft_ms,
     )
 
-    raw = _collect_results(
-        client,
-        workload_path,
-        KVSWITCH_SERVICE_IP,
-        KVSWITCH_UDP_PORT,
-        client_timeout,
-        kvswitch=True,
-    )
+    try:
+        raw = _collect_results(
+            client,
+            workload_path,
+            KVSWITCH_SERVICE_IP,
+            KVSWITCH_UDP_PORT,
+            client_timeout,
+            kvswitch=True,
+        )
+    finally:
+        controller.close()
+        _kill_bg(relay_host)
+        _stop_workers(net, n_workers)
 
-    controller.close()
-    _stop_workers(net, n_workers)
     return _to_request_metrics(raw, "kvswitch")
 
 
