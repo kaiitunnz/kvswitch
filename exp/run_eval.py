@@ -978,7 +978,7 @@ def run_baseline_kvswitch(
         # Warm-up: send requests to populate both TCAM prefix rules and worker
         # caches.  Workers stay running so switch and cache state are consistent.
         warmup_workload = _build_warmup_workload(
-            workload_path, n_per_group=max(admission_threshold, 10)
+            workload_path, n_per_group=max(admission_threshold, 20)
         )
         if warmup_workload:
             warmup_path = "/tmp/eval_warmup.json"
@@ -996,7 +996,7 @@ def run_baseline_kvswitch(
                 client_timeout,
                 kvswitch=True,
             )
-            time.sleep(1.0)
+            time.sleep(2.0)
             logger.info(
                 "Warm-up complete. Controller snapshot: spine_rules=%d leaf_rules=%d",
                 len(controller.spine_tcam.snapshot()),
