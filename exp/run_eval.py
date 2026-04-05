@@ -912,7 +912,6 @@ def run_baseline_kvswitch(
             spine_switches=topo.spine_names,
             coalesce_interval_s=2.0,
             admission_threshold=admission_threshold,
-            reroute_score_threshold=0.2,
         )
         controller_runtime.run(controller.start())
         logger.info(

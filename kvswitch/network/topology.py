@@ -53,11 +53,6 @@ def clos_worker_ip(leaf_idx: int, worker_idx: int) -> str:
     return f"{CLOS_WORKER_LEAF_SUBNET_PREFIX}.{leaf_idx}.{worker_idx + 1}"
 
 
-def clos_worker_subnet(leaf_idx: int) -> str:
-    """Subnet prefix for a Clos worker leaf: ``10.2.{leaf_idx}``."""
-    return f"{CLOS_WORKER_LEAF_SUBNET_PREFIX}.{leaf_idx}"
-
-
 class SpineLeafTopo(Topo):
     """Single-spine, single-leaf topology with optional L7 router host.
 

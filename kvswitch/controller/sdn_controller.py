@@ -183,7 +183,6 @@ class SDNController:
         adapter: SwitchAdapter | None = None,
         spine_switches: list[str] | None = None,
         coalesce_interval_s: float = 0.0,
-        reroute_score_threshold: float = 0.0,
     ) -> None:
         self._workers = {worker.worker_id: worker for worker in workers}
         self._server = UDPServer(host=host, port=port, handler=self._handle)
@@ -191,7 +190,6 @@ class SDNController:
         self._spine_switches = spine_switches or []
         self.alpha = alpha
         self.beta = beta
-        self._reroute_score_threshold = reroute_score_threshold
 
         self.spine_tcam = TcamManager(
             admission_threshold=admission_threshold,
