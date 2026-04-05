@@ -453,6 +453,16 @@ class SDNController:
             leaf: sum(self._inverse_queue_weight(w) for w in ws)
             for leaf, ws in leaves_with_prefix.items()
         }
+
+        # Probe-fraction seeding: allocate a small weight to uncovered leaves
+        # so ~1 ECMP bucket sends traffic there.  This seeds cross-leaf
+        # replication deterministically — the probe worker caches the prefix,
+        # emits alloc, and the next reconciliation replaces the probe weight
+        # with real load-based weight.
+        uncovered = set(self.leaf_tcams) - set(leaves_with_prefix)
+        for leaf in uncovered:
+            per_leaf_weights[leaf] = 0.05
+
         bucket_map = self._allocate_buckets(per_leaf_weights)
 
         # Assign or reuse ECMP group ID.
