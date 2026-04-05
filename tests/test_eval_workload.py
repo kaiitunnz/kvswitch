@@ -14,7 +14,10 @@ from kvswitch.sdk.hashing import compute_truncated_hashes
 
 class _DummyTokenizer:
     def encode(self, text: str) -> list[int]:
-        assert text == "prompt"
+        if text == "prompt":
+            return list(range(255))
+        if text == "reply":
+            return list(range(10))
         return list(range(255))
 
 
@@ -60,8 +63,8 @@ class TestWorkloadGeneration:
         generator = WorkloadGenerator(config)
 
         monkeypatch.setattr(
-            "kvswitch.eval.workload.load_sharegpt_prompts",
-            lambda path, max_items=None: ["prompt"],
+            "kvswitch.eval.workload.load_sharegpt_conversations",
+            lambda path, max_items=None: [("prompt", "reply")],
         )
         monkeypatch.setattr(generator, "_get_tokenizer", lambda: _DummyTokenizer())
 
@@ -74,3 +77,4 @@ class TestWorkloadGeneration:
         )
         assert request.prefix_hashes is not None
         assert len(request.prefix_hashes) == 1
+        assert request.max_tokens == 10  # inferred from GPT reply tokenization

@@ -45,7 +45,7 @@ class WorkloadConfig:
     num_prefix_groups: int = 3
     system_prompt_tokens: int = 256  # tokens per injected system prompt
     max_prompt_tokens: int = 2048
-    max_output_tokens: int = 16
+    max_output_tokens: int = 256
     seed: int = 42
     model: str = "meta-llama/Llama-3.2-3B-Instruct"
     hash_key: str = DEFAULT_HASH_KEY
@@ -56,27 +56,35 @@ class WorkloadConfig:
 # ---------------------------------------------------------------------------
 
 
-def load_sharegpt_prompts(path: Path, max_items: int | None = None) -> list[str]:
-    """Extract the first human turn from each ShareGPT conversation.
+def load_sharegpt_conversations(
+    path: Path, max_items: int | None = None
+) -> list[tuple[str, str | None]]:
+    """Extract the first human turn and the following GPT reply from each conversation.
 
-    Returns a list of prompt strings (not yet tokenized).
+    Returns a list of ``(human_text, gpt_reply_or_none)`` pairs.
     """
     with open(path) as f:
         data = json.load(f)
 
-    prompts: list[str] = []
+    pairs: list[tuple[str, str | None]] = []
     for item in data:
         conversations = item.get("conversations", [])
+        human_text: str | None = None
+        gpt_reply: str | None = None
         for turn in conversations:
-            if turn.get("from") == "human":
+            if human_text is None and turn.get("from") == "human":
                 text = turn.get("value", "").strip()
                 if text:
-                    prompts.append(text)
-                break  # only first human turn
-        if max_items is not None and len(prompts) >= max_items:
+                    human_text = text
+            elif human_text is not None and turn.get("from") == "gpt":
+                gpt_reply = turn.get("value", "").strip() or None
+                break
+        if human_text:
+            pairs.append((human_text, gpt_reply))
+        if max_items is not None and len(pairs) >= max_items:
             break
 
-    return prompts
+    return pairs
 
 
 # ---------------------------------------------------------------------------
@@ -126,20 +134,30 @@ class WorkloadGenerator:
         cfg = self.config
         rng = random.Random(cfg.seed)
 
-        # Load and tokenize ShareGPT prompts.
-        raw_prompts = load_sharegpt_prompts(
+        # Load ShareGPT conversations (human turn + GPT reply).
+        raw_pairs = load_sharegpt_conversations(
             cfg.dataset_path, max_items=cfg.num_requests * 2
         )
-        if not raw_prompts:
-            raise ValueError(f"No prompts loaded from {cfg.dataset_path}")
-        logger.info("Loaded %d raw prompts from ShareGPT", len(raw_prompts))
+        if not raw_pairs:
+            raise ValueError(f"No conversations loaded from {cfg.dataset_path}")
+        logger.info("Loaded %d raw prompts from ShareGPT", len(raw_pairs))
 
         tokenizer = self._get_tokenizer()
-        tokenized: list[list[int]] = []
-        for text in raw_prompts:
-            ids = tokenizer.encode(text)
-            if len(ids) > 0:
-                tokenized.append(ids[: cfg.max_prompt_tokens])
+        tokenized: list[tuple[list[int], int]] = []
+        for human_text, gpt_reply in raw_pairs:
+            prompt_ids = tokenizer.encode(human_text)
+            if not prompt_ids:
+                continue
+            prompt_ids = prompt_ids[: cfg.max_prompt_tokens]
+            # Infer output tokens from the GPT reply; fall back to default.
+            if gpt_reply:
+                output_tokens = min(
+                    len(tokenizer.encode(gpt_reply)), cfg.max_output_tokens
+                )
+            else:
+                output_tokens = cfg.max_output_tokens
+            output_tokens = max(output_tokens, 1)
+            tokenized.append((prompt_ids, output_tokens))
             if len(tokenized) >= cfg.num_requests:
                 break
 
@@ -163,7 +181,7 @@ class WorkloadGenerator:
         t = 0.0
 
         for i in range(cfg.num_requests):
-            user_tokens = tokenized[i]
+            user_tokens, output_tokens = tokenized[i]
 
             # Assign to a prefix group with probability prefix_sharing_ratio.
             if rng.random() < cfg.prefix_sharing_ratio:
@@ -193,7 +211,7 @@ class WorkloadGenerator:
                     prompt_token_ids=prompt_ids,
                     scheduled_time=t,
                     prefix_group=group,
-                    max_tokens=cfg.max_output_tokens,
+                    max_tokens=output_tokens,
                     prefix_hashes=prefix_hashes,
                 )
             )

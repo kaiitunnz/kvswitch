@@ -1071,8 +1071,8 @@ def main() -> None:
     parser.add_argument("--request-rate", type=float, default=10.0)
     parser.add_argument("--prefix-sharing-ratio", type=float, default=0.5)
     parser.add_argument("--num-prefix-groups", type=int, default=16)
-    parser.add_argument("--system-prompt-tokens", type=int, default=256)
-    parser.add_argument("--max-output-tokens", type=int, default=16)
+    parser.add_argument("--system-prompt-tokens", type=int, default=512)
+    parser.add_argument("--max-output-tokens", type=int, default=256)
     parser.add_argument(
         "--traces",
         type=str,
