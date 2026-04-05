@@ -25,6 +25,7 @@ class RoutingResult:
     worker_idx: int
     matched_blocks: int
     total_blocks: int
+    block_hashes: list[bytes]
     tokenize_ms: float
     hash_ms: float
     lookup_ms: float
@@ -104,6 +105,7 @@ class L7Router:
             worker_idx=worker_idx,
             matched_blocks=matched,
             total_blocks=len(block_hashes),
+            block_hashes=block_hashes,
             tokenize_ms=tokenize_ms,
             hash_ms=hash_ms,
             lookup_ms=lookup_ms,
@@ -128,6 +130,7 @@ class L7Router:
             worker_idx=worker_idx,
             matched_blocks=matched,
             total_blocks=len(block_hashes),
+            block_hashes=block_hashes,
             tokenize_ms=0.0,
             hash_ms=hash_ms,
             lookup_ms=lookup_ms,

@@ -97,6 +97,10 @@ class L7Proxy:
         )
         worker_resp = await fwd_client.send(request.data)
 
+        # Update the router's cache directory so future requests with the
+        # same prefix are routed to this worker.
+        self.router.update_cache(worker_idx, routing_result.block_hashes)
+
         total_ms = (time.perf_counter() - t_start) * 1000
 
         # Annotate response with routing metadata.
