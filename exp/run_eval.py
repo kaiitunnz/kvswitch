@@ -33,10 +33,11 @@ from mininet.node import Node, Switch
 
 from kvswitch.controller.finsy_adapter import FinsyAdapter
 from kvswitch.controller.sdn_controller import (
+    ECMP_BUCKETS,
     SDNController,
     parse_worker_placements,
 )
-from kvswitch.controller.switch_adapter import TableAddOp
+from kvswitch.controller.switch_adapter import SwitchOp, TableAddOp, TableClearOp
 from kvswitch.eval.metrics import (
     RequestMetric,
     compute_summary,
@@ -289,6 +290,46 @@ def _configure_kvswitch_service(net: Mininet, n_workers: int) -> None:
     )
 
 
+def _kvswitch_packet_size(req: WorkloadRequest) -> int:
+    """Compute the KVSwitch UDP packet size for a workload request."""
+    payload = {
+        "endpoint": "generate",
+        "prompt_token_ids": req.prompt_token_ids,
+        "max_tokens": req.max_tokens,
+    }
+    return HEADER_SIZE + len(json.dumps(payload).encode("utf-8"))
+
+
+def _filter_oversized_requests(
+    requests: list[WorkloadRequest],
+    max_payload_bytes: int,
+) -> list[WorkloadRequest]:
+    """Remove requests whose KVSwitch packet exceeds the payload limit.
+
+    Returns the filtered list; logs which requests were dropped and why.
+    """
+    kept: list[WorkloadRequest] = []
+    dropped: list[tuple[int, int, int]] = []
+    for req in requests:
+        size = _kvswitch_packet_size(req)
+        if size > max_payload_bytes:
+            dropped.append((req.request_id, len(req.prompt_token_ids), size))
+        else:
+            kept.append(req)
+    if dropped:
+        examples = ", ".join(
+            f"req={rid}/tokens={tok}/bytes={sz}" for rid, tok, sz in dropped[:5]
+        )
+        logger.warning(
+            "Dropped %d/%d KVSwitch requests exceeding %dB payload limit. Examples: %s",
+            len(dropped),
+            len(requests),
+            max_payload_bytes,
+            examples,
+        )
+    return kept
+
+
 def _log_kvswitch_packet_sizes(requests: Iterable[WorkloadRequest]) -> None:
     """Log KVSwitch packet sizes and warn if they exceed standard MTU."""
     if not requests:
@@ -297,15 +338,10 @@ def _log_kvswitch_packet_sizes(requests: Iterable[WorkloadRequest]) -> None:
     packet_sizes: list[int] = []
     oversized: list[tuple[int, int, int]] = []
     for req in requests:
-        payload = {
-            "endpoint": "generate",
-            "prompt_token_ids": req.prompt_token_ids,
-            "max_tokens": req.max_tokens,
-        }
-        packet_size = HEADER_SIZE + len(json.dumps(payload).encode("utf-8"))
-        packet_sizes.append(packet_size)
-        if packet_size > 1500:
-            oversized.append((req.request_id, len(req.prompt_token_ids), packet_size))
+        size = _kvswitch_packet_size(req)
+        packet_sizes.append(size)
+        if size > 1500:
+            oversized.append((req.request_id, len(req.prompt_token_ids), size))
 
     logger.info(
         "KVSwitch UDP payload sizes: min=%dB p50=%dB max=%dB",
@@ -473,6 +509,7 @@ def _start_workers(
     base_ttft_ms: float | None = None,
     per_token_ttft_ms: float | None = None,
     ttft_ms: float = 10.0,
+    load_update_interval_ms: float = 50.0,
 ) -> None:
     """Start mock workers on all worker hosts."""
     for i in range(n_workers):
@@ -482,6 +519,7 @@ def _start_workers(
             f" --host 0.0.0.0 --port {WORKER_PORT}"
             f" --ttft-ms {ttft_ms} --tpot-ms {tpot_ms}"
             f" --worker-id worker{i}"
+            f" --load-update-interval-ms {load_update_interval_ms}"
         )
         if base_ttft_ms is not None and per_token_ttft_ms is not None:
             cmd += f" --base-ttft-ms {base_ttft_ms} --per-token-ttft-ms {per_token_ttft_ms}"
@@ -548,6 +586,74 @@ def _stop_workers(net: Mininet, n_workers: int) -> None:
         _kill_bg(_get_node(net, f"worker{i}"))
 
 
+def _program_uniform_ecmp(
+    net: Mininet,
+    n_workers: int,
+    adapter: FinsyAdapter,
+) -> None:
+    """Program uniform ECMP tables on spine and leaf for L4 round-robin."""
+    spine = _get_node(net, "s1")
+    leaf = _get_node(net, "s2")
+
+    # Find spine → leaf port.
+    spine_port_to_leaf: int | None = None
+    for port_num, intf in enumerate(spine.intfList()):
+        if intf.name == "lo" or intf.link is None:
+            continue
+        other = intf.link.intf1 if intf.link.intf2 == intf else intf.link.intf2
+        if other.node == leaf:
+            spine_port_to_leaf = port_num
+            break
+    if spine_port_to_leaf is None:
+        raise RuntimeError("cannot find spine→leaf port")
+
+    # Spine ECMP: all buckets → single leaf (only one pod).
+    spine_ops: list[SwitchOp] = [TableClearOp(switch="s1", table="spine_ecmp_select")]
+    for bucket in range(ECMP_BUCKETS):
+        spine_ops.append(
+            TableAddOp(
+                switch="s1",
+                table="spine_ecmp_select",
+                action="route_to_pod",
+                match={"meta.ecmp_bucket": bucket},
+                action_params={"port": spine_port_to_leaf},
+            )
+        )
+    adapter.apply_ops(spine_ops)
+
+    # Leaf ECMP: distribute buckets evenly across workers.
+    leaf_ops: list[SwitchOp] = [TableClearOp(switch="s2", table="leaf_ecmp_select")]
+    for bucket in range(ECMP_BUCKETS):
+        worker_idx = bucket % n_workers
+        worker = _get_node(net, f"worker{worker_idx}")
+        leaf_port: int | None = None
+        for port_num, intf in enumerate(leaf.intfList()):
+            if intf.name == "lo" or intf.link is None:
+                continue
+            other = intf.link.intf1 if intf.link.intf2 == intf else intf.link.intf2
+            if other.node == worker:
+                leaf_port = port_num
+                break
+        if leaf_port is None:
+            raise RuntimeError(f"cannot find leaf port for worker{worker_idx}")
+        leaf_ops.append(
+            TableAddOp(
+                switch="s2",
+                table="leaf_ecmp_select",
+                action="route_to_worker",
+                match={"meta.ecmp_bucket": bucket},
+                action_params={
+                    "port": leaf_port,
+                    "dst_mac": int(worker.MAC().replace(":", ""), 16),
+                },
+            )
+        )
+    adapter.apply_ops(leaf_ops)
+    logger.info(
+        "Programmed uniform ECMP tables for L4 round-robin (%d workers)", n_workers
+    )
+
+
 def run_baseline_l4_rr(
     net: Mininet,
     n_workers: int,
@@ -556,32 +662,55 @@ def run_baseline_l4_rr(
     max_output_tokens: int,
     workload_path: str,
     client_timeout: float,
+    adapter: FinsyAdapter,
     base_ttft_ms: float | None = None,
     per_token_ttft_ms: float | None = None,
 ) -> list[RequestMetric]:
-    """L4 Round-Robin: TCAM empty → ECMP distributes traffic."""
+    """L4 Round-Robin: uniform ECMP distributes traffic via KVSwitch VIP."""
     logger.info("--- Baseline: L4 Round-Robin ---")
+
+    # Configure the KVSwitch virtual service (VIP + MAC) and program
+    # uniform ECMP tables — same datapath as KVSwitch but without
+    # prefix-aware rules.
+    _configure_kvswitch_service(net, n_workers)
+    _program_uniform_ecmp(net, n_workers, adapter)
+
     _start_workers(
         net,
         n_workers,
         tpot_ms,
         max_output_tokens,
+        kvswitch_port=KVSWITCH_UDP_PORT,
         base_ttft_ms=base_ttft_ms,
         per_token_ttft_ms=per_token_ttft_ms,
         ttft_ms=ttft_ms,
     )
 
-    # Pre-populate ECMP tables with uniform weights for all workers.
-    # For now, workers are reachable directly; ECMP hashing distributes.
-    # The client sends to a well-known worker IP (we round-robin in client).
-    # TODO: With BMv2, program ECMP tables via simple_switch_CLI.
-
-    # For the initial implementation, the client round-robins across worker IPs.
-    # The workload_client sends to a single target, so we use worker0.
-    # In a full implementation, the BMv2 ECMP table would handle distribution.
     client = _get_node(net, "client")
+
+    # Warm up worker caches so the timed run reflects steady-state.
+    warmup_workload = _build_warmup_workload(workload_path)
+    if warmup_workload:
+        warmup_path = "/tmp/eval_warmup.json"
+        with open(warmup_path, "w") as f:
+            json.dump(warmup_workload, f)
+        logger.info("L4 RR warm-up: %d requests", len(warmup_workload))
+        _collect_results(
+            client,
+            warmup_path,
+            KVSWITCH_SERVICE_IP,
+            KVSWITCH_UDP_PORT,
+            client_timeout,
+            kvswitch=True,
+        )
+
     raw = _collect_results(
-        client, workload_path, worker_ip(0), WORKER_PORT, client_timeout
+        client,
+        workload_path,
+        KVSWITCH_SERVICE_IP,
+        KVSWITCH_UDP_PORT,
+        client_timeout,
+        kvswitch=True,
     )
 
     _stop_workers(net, n_workers)
@@ -634,6 +763,21 @@ def run_baseline_l7(
         log_out = router_host.cmd(f"cat {proxy_log}")
         logger.error("L7 proxy log:\n%s", log_out)
         raise
+
+    # Warm up worker caches and router prefix table.
+    warmup_workload = _build_warmup_workload(workload_path)
+    if warmup_workload:
+        warmup_path = "/tmp/eval_warmup.json"
+        with open(warmup_path, "w") as f:
+            json.dump(warmup_workload, f)
+        logger.info("L7 warm-up: %d requests", len(warmup_workload))
+        _collect_results(
+            client,
+            warmup_path,
+            ROUTER_IP,
+            ROUTER_PORT,
+            client_timeout,
+        )
 
     raw = _collect_results(
         client, workload_path, ROUTER_IP, ROUTER_PORT, client_timeout
@@ -704,6 +848,39 @@ def _start_controller_relay(
     return controller_host, relay_log
 
 
+def _build_warmup_workload(workload_path: str, n_per_group: int = 2) -> list[dict]:
+    """Pick representative requests per prefix group for warm-up.
+
+    Selects up to *n_per_group* requests from each prefix group so that:
+
+    - the controller sees enough alloc events to pass ``admission_threshold``
+    - the workers' local caches are seeded for the group's system-prompt prefix
+    - deeper prefix-chain entries get at least partial TCAM coverage
+
+    All warm-up requests fire immediately (``scheduled_time=0``).
+    """
+    with open(workload_path) as f:
+        requests: list[dict] = json.load(f)
+    group_counts: dict[str, int] = {}
+    warmup: list[dict] = []
+    for req in requests:
+        group = req.get("prefix_group", "none")
+        if group == "none":
+            continue
+        count = group_counts.get(group, 0)
+        if count >= n_per_group:
+            continue
+        group_counts[group] = count + 1
+        warmup.append(
+            {
+                **req,
+                "request_id": 90000 + len(warmup),
+                "scheduled_time": 0.0,
+            }
+        )
+    return warmup
+
+
 def run_baseline_kvswitch(
     net: Mininet,
     n_workers: int,
@@ -716,6 +893,7 @@ def run_baseline_kvswitch(
     controller_runtime: AsyncLoopThread,
     base_ttft_ms: float | None = None,
     per_token_ttft_ms: float | None = None,
+    admission_threshold: int = 2,
 ) -> list[RequestMetric]:
     """KVSwitch: SDN controller populates TCAM; switches route shim-header traffic."""
     logger.info("--- Baseline: KVSwitch ---")
@@ -737,6 +915,9 @@ def run_baseline_kvswitch(
         port=CONTROLLER_PORT,
         adapter=adapter,
         spine_switch="s1",
+        coalesce_interval_s=0.5,
+        admission_threshold=admission_threshold,
+        reroute_score_threshold=0.2,
     )
     controller_runtime.run(controller.start())
     logger.info(
@@ -761,13 +942,6 @@ def run_baseline_kvswitch(
 
     # Start workers with controller connection and KVSwitch listener.
     client = _get_node(net, "client")
-    try:
-        _wait_for_service(client, CONTROLLER_IP, CONTROLLER_PORT, timeout=30.0)
-    except TimeoutError:
-        logger.error("Controller relay log:\n%s", relay_host.cmd(f"cat {relay_log}"))
-        controller.close()
-        raise
-
     _start_workers(
         net,
         n_workers,
@@ -780,6 +954,34 @@ def run_baseline_kvswitch(
         per_token_ttft_ms=per_token_ttft_ms,
         ttft_ms=ttft_ms,
     )
+
+    # Warm-up: send requests to populate both TCAM prefix rules and worker
+    # caches.  Workers stay running so switch and cache state are consistent.
+    warmup_workload = _build_warmup_workload(
+        workload_path, n_per_group=max(admission_threshold, 2)
+    )
+    if warmup_workload:
+        warmup_path = "/tmp/eval_warmup.json"
+        with open(warmup_path, "w") as f:
+            json.dump(warmup_workload, f)
+        logger.info(
+            "Running %d warm-up requests to populate TCAM rules and caches...",
+            len(warmup_workload),
+        )
+        _collect_results(
+            client,
+            warmup_path,
+            KVSWITCH_SERVICE_IP,
+            KVSWITCH_UDP_PORT,
+            client_timeout,
+            kvswitch=True,
+        )
+        time.sleep(1.0)
+        logger.info(
+            "Warm-up complete. Controller snapshot: spine_rules=%d leaf_rules=%d",
+            len(controller.spine_tcam.snapshot()),
+            len(controller.leaf_tcam.snapshot()),
+        )
 
     try:
         raw = _collect_results(
@@ -867,6 +1069,13 @@ def main() -> None:
         help="Override per-token TTFT for linear model (else fitted from traces)",
     )
     parser.add_argument("--client-timeout", type=float, default=60.0)
+    parser.add_argument(
+        "--max-kvswitch-payload",
+        type=int,
+        default=9000,
+        help="Drop KVSwitch requests whose UDP payload exceeds this size in bytes",
+    )
+    parser.add_argument("--admission-threshold", type=int, default=2)
     parser.add_argument("--output-dir", type=str, default="results/eval")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log-level", type=str, default="INFO")
@@ -913,10 +1122,14 @@ def main() -> None:
     )
 
     # --- Generate workload ---
-    logger.info("Generating workload...")
+    # Over-generate to compensate for oversized-packet filtering, so the
+    # final workload has exactly num_requests entries.
+    target = args.num_requests
+    overshoot = int(target * 1.5)
+    logger.info("Generating workload (target=%d, generating=%d)...", target, overshoot)
     wl_config = WorkloadConfig(
         dataset_path=Path(args.dataset),
-        num_requests=args.num_requests,
+        num_requests=overshoot,
         request_rate=args.request_rate,
         prefix_sharing_ratio=args.prefix_sharing_ratio,
         num_prefix_groups=args.num_prefix_groups,
@@ -926,12 +1139,33 @@ def main() -> None:
         model=args.model,
     )
     generator = WorkloadGenerator(wl_config)
-    requests = generator.generate()
-    _log_kvswitch_packet_sizes(requests)
+    raw_requests = generator.generate()
+    _log_kvswitch_packet_sizes(raw_requests)
 
-    # Write workload to a temp file accessible inside Mininet.
+    # Filter oversized packets, then trim to exact target count.
+    requests = _filter_oversized_requests(raw_requests, args.max_kvswitch_payload)
+    if len(requests) < target:
+        logger.warning(
+            "Only %d requests remain after filtering (target %d); using all",
+            len(requests),
+            target,
+        )
+    else:
+        requests = requests[:target]
+
+    # Re-number request IDs and recalculate scheduled times so arrival
+    # times are contiguous after the oversized gaps are removed.
+    t = 0.0
+    rng = __import__("random").Random(args.seed + 1)
+    for i, req in enumerate(requests):
+        req.request_id = i
+        req.scheduled_time = t
+        if args.request_rate > 0:
+            t += rng.expovariate(args.request_rate)
+
     workload_path = "/tmp/eval_workload.json"
     save_workload(requests, Path(workload_path))
+    logger.info("Final workload: %d requests", len(requests))
 
     # Resolve compiled P4 artifacts up front so both BMv2 and Finsy use
     # the same inputs regardless of whether the caller passed a JSON file
@@ -993,6 +1227,7 @@ def main() -> None:
                     args.max_output_tokens,
                     workload_path,
                     args.client_timeout,
+                    adapter=finsy_adapter,
                     base_ttft_ms=base_ttft_ms,
                     per_token_ttft_ms=per_token_ttft_ms,
                 )
@@ -1022,6 +1257,7 @@ def main() -> None:
                     controller_runtime=controller_runtime,
                     base_ttft_ms=base_ttft_ms,
                     per_token_ttft_ms=per_token_ttft_ms,
+                    admission_threshold=args.admission_threshold,
                 )
             else:
                 continue
