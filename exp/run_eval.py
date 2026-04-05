@@ -551,8 +551,8 @@ def _start_workers(
     ttft_ms: float = 10.0,
     load_update_interval_ms: float = 500.0,
     load_update_delta: int = 500,
-    max_num_batched_tokens: int = 2048,
-    max_num_seqs: int = 4,
+    max_num_batched_tokens: int = 8192,
+    max_num_seqs: int = 256,
 ) -> None:
     """Start mock workers on all worker hosts."""
     for i in range(n_workers):
@@ -1036,7 +1036,7 @@ def main() -> None:
         help="Comma-separated baselines: l4_rr, l7, kvswitch",
     )
     parser.add_argument("--n-spines", type=int, default=2)
-    parser.add_argument("--n-worker-leaves", type=int, default=1)
+    parser.add_argument("--n-worker-leaves", type=int, default=2)
     parser.add_argument("--workers-per-leaf", type=int, default=4)
     parser.add_argument("--num-requests", type=int, default=200)
     parser.add_argument("--request-rate", type=float, default=10.0)
