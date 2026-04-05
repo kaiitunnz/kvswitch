@@ -183,7 +183,6 @@ class SDNController:
         adapter: SwitchAdapter | None = None,
         spine_switches: list[str] | None = None,
         coalesce_interval_s: float = 0.0,
-        reroute_score_threshold: float = 50.0,
     ) -> None:
         self._workers = {worker.worker_id: worker for worker in workers}
         self._server = UDPServer(host=host, port=port, handler=self._handle)
@@ -191,7 +190,6 @@ class SDNController:
         self._spine_switches = spine_switches or []
         self.alpha = alpha
         self.beta = beta
-        self._reroute_score_threshold = reroute_score_threshold
 
         self.spine_tcam = TcamManager(
             admission_threshold=admission_threshold,
@@ -218,9 +216,17 @@ class SDNController:
         self._leaf_ecmp_bucket_maps: dict[str, dict[int, str]] = defaultdict(dict)
 
         # Per-prefix ECMP group state for spine switches.
+        # Per-prefix ECMP group state (spine tier).
         self._next_group_id: int = 0
         self._prefix_group_ids: dict[tuple[int, ...], int] = {}
         self._prefix_ecmp_bucket_maps: dict[str, dict[tuple[int, ...], dict[int, str]]] = (
+            defaultdict(dict)
+        )
+
+        # Per-prefix ECMP group state (leaf tier).
+        self._next_leaf_group_id: int = 0
+        self._leaf_prefix_group_ids: dict[str, dict[PrefixKey, int]] = defaultdict(dict)
+        self._leaf_prefix_ecmp_bucket_maps: dict[str, dict[PrefixKey, dict[int, str]]] = (
             defaultdict(dict)
         )
 
@@ -371,50 +377,6 @@ class SDNController:
     def _mac_int(mac: str) -> int:
         return int(mac.replace(":", ""), 16)
 
-    def _leaf_add_op(self, prefix: PrefixKey, worker_id: str) -> tuple[str, TableAddOp]:
-        worker = self._workers[worker_id]
-        match: dict[str, str | int] = {}
-        for idx, field_name in enumerate(
-            ("hdr.kvswitch.h0", "hdr.kvswitch.h1", "hdr.kvswitch.h2")
-        ):
-            value = prefix[idx] if idx < len(prefix) else 0
-            mask = 0xFFFFFFFF if idx < len(prefix) else 0
-            match[field_name] = f"0x{value:08x}&&&0x{mask:08x}"
-        return (
-            worker.leaf_switch,
-            TableAddOp(
-                switch=worker.leaf_switch,
-                table="leaf_prefix_route",
-                action="route_to_worker",
-                match=match,
-                action_params={
-                    "port": worker.leaf_port,
-                    "dst_mac": self._mac_int(worker.worker_mac),
-                },
-                priority=1,
-            ),
-        )
-
-    def _leaf_delete_op(
-        self, prefix: PrefixKey, worker_id: str
-    ) -> tuple[str, TableDeleteOp]:
-        worker = self._workers[worker_id]
-        match: dict[str, str | int] = {}
-        for idx, field_name in enumerate(
-            ("hdr.kvswitch.h0", "hdr.kvswitch.h1", "hdr.kvswitch.h2")
-        ):
-            value = prefix[idx] if idx < len(prefix) else 0
-            mask = 0xFFFFFFFF if idx < len(prefix) else 0
-            match[field_name] = f"0x{value:08x}&&&0x{mask:08x}"
-        return (
-            worker.leaf_switch,
-            TableDeleteOp(
-                switch=worker.leaf_switch,
-                table="leaf_prefix_route",
-                match=match,
-                priority=1,
-            ),
-        )
 
     def _leaf_switch_for_prefix(self, prefix: PrefixKey) -> str:
         candidates = self._leaf_locations.get(prefix)
@@ -580,10 +542,11 @@ class SDNController:
         hit_count: int,
         now: float,
     ) -> list[SwitchOp]:
-        """Install leaf prefix rules on every leaf that has cached candidates.
+        """Install per-prefix leaf ECMP groups on every leaf with candidates.
 
-        Each leaf independently picks its best local worker using
-        score-conditional stickiness.
+        Mirrors the spine tier: each leaf gets a weighted ECMP group across
+        local workers that have the prefix cached, with probe-fraction
+        seeding for uncovered local workers.
         """
         candidates = self._leaf_locations.get(prefix, set())
         if not candidates:
@@ -602,49 +565,144 @@ class SDNController:
             if not tcam.admitted(prefix, now):
                 continue
 
-            existing = tcam.installed_rule(prefix)
-            best_local = self._select_worker(local_candidates)
+            # Compute per-worker weights for this leaf.
+            per_worker_weights: dict[str, float] = {
+                w: self._inverse_queue_weight(w) for w in local_candidates
+            }
 
-            # Score-conditional stickiness within this leaf.
-            if existing is not None and existing.target_id in local_candidates:
-                score_gap = (
-                    self._worker_score(best_local)
-                    - self._worker_score(existing.target_id)
-                )
-                if (
-                    best_local == existing.target_id
-                    or score_gap <= self._reroute_score_threshold
-                ):
-                    tcam.install(
-                        prefix, existing.target_id, hit_count=hit_count, now=now
-                    )
-                    continue
+            # Probe-fraction seeding: uncovered local workers get probe weight.
+            all_local_workers = {
+                w_id for w_id, w in self._workers.items()
+                if w.leaf_switch == leaf_switch
+            }
+            uncovered = all_local_workers - local_candidates
+            for w in uncovered:
+                per_worker_weights[w] = 0.05
 
-            worker_id = best_local
-            previous = existing.target_id if existing is not None else None
-            _, evicted = tcam.install(prefix, worker_id, hit_count=hit_count, now=now)
+            bucket_map = self._allocate_buckets(per_worker_weights)
+
+            # Assign or reuse leaf ECMP group ID.
+            leaf_groups = self._leaf_prefix_group_ids[leaf_switch]
+            if prefix not in leaf_groups:
+                leaf_groups[prefix] = self._next_leaf_group_id
+                self._next_leaf_group_id += 1
+            group_id = leaf_groups[prefix]
+
+            # Check if bucket map changed.
+            old_bucket_map = self._leaf_prefix_ecmp_bucket_maps[leaf_switch].get(prefix)
+            if old_bucket_map == bucket_map:
+                # Still update TCAM bookkeeping.
+                representative = self._select_worker(local_candidates)
+                tcam.install(prefix, representative, hit_count=hit_count, now=now)
+                continue
+
+            representative = self._select_worker(local_candidates)
+            _, evicted = tcam.install(
+                prefix, representative, hit_count=hit_count, now=now
+            )
 
             ops: list[SwitchOp] = []
-            if previous is not None:
-                _, del_op = self._leaf_delete_op(prefix, previous)
-                ops.append(del_op)
+            # Build leaf_prefix_route match.
+            match: dict[str, str | int] = {}
+            for idx, field_name in enumerate(
+                ("hdr.kvswitch.h0", "hdr.kvswitch.h1", "hdr.kvswitch.h2")
+            ):
+                value = prefix[idx] if idx < len(prefix) else 0
+                mask = 0xFFFFFFFF if idx < len(prefix) else 0
+                match[field_name] = f"0x{value:08x}&&&0x{mask:08x}"
+
+            # Delete old route entry if exists.
+            if old_bucket_map is not None:
+                ops.append(TableDeleteOp(
+                    switch=leaf_switch, table="leaf_prefix_route",
+                    match=match, priority=1,
+                ))
+            # Install route: prefix → group_id.
+            ops.append(TableAddOp(
+                switch=leaf_switch, table="leaf_prefix_route",
+                action="set_leaf_prefix_ecmp_group",
+                match=match,
+                action_params={"group_id": group_id},
+                priority=1,
+            ))
+
+            # Clear old bucket entries and install new ones.
+            if old_bucket_map is not None:
+                for old_bucket in old_bucket_map:
+                    ops.append(TableDeleteOp(
+                        switch=leaf_switch, table="leaf_prefix_ecmp",
+                        match={
+                            "meta.leaf_prefix_ecmp_group": group_id,
+                            "meta.ecmp_bucket": old_bucket,
+                        },
+                    ))
+            for bucket, worker_id in bucket_map.items():
+                worker = self._workers[worker_id]
+                ops.append(TableAddOp(
+                    switch=leaf_switch, table="leaf_prefix_ecmp",
+                    action="route_to_worker",
+                    match={
+                        "meta.leaf_prefix_ecmp_group": group_id,
+                        "meta.ecmp_bucket": bucket,
+                    },
+                    action_params={
+                        "port": worker.leaf_port,
+                        "dst_mac": self._mac_int(worker.worker_mac),
+                    },
+                ))
+
             if evicted is not None:
-                _, evict_op = self._leaf_delete_op(evicted[0], evicted[1].target_id)
-                ops.append(evict_op)
-            _, add_op = self._leaf_add_op(prefix, worker_id)
-            ops.append(add_op)
+                all_ops.extend(
+                    self._delete_leaf_prefix_ecmp_group(leaf_switch, evicted[0])
+                )
+
             self._adapter.apply_ops(ops)
+            self._leaf_prefix_ecmp_bucket_maps[leaf_switch][prefix] = dict(bucket_map)
             all_ops.extend(ops)
 
             logger.debug(
-                "Leaf rule prefix=%s worker=%s leaf=%s (prev=%s)",
+                "Leaf prefix ECMP prefix=%s group=%d leaf=%s workers=%s",
                 format_prefix_key(prefix),
-                worker_id,
+                group_id,
                 leaf_switch,
-                previous,
+                list(per_worker_weights.keys()),
             )
 
         return all_ops
+
+    def _delete_leaf_prefix_ecmp_group(
+        self, leaf_switch: str, prefix: PrefixKey
+    ) -> list[SwitchOp]:
+        """Remove a prefix's leaf ECMP group."""
+        leaf_groups = self._leaf_prefix_group_ids.get(leaf_switch, {})
+        group_id = leaf_groups.pop(prefix, None)
+        if group_id is None:
+            return []
+        old_map = self._leaf_prefix_ecmp_bucket_maps[leaf_switch].pop(prefix, None)
+        ops: list[SwitchOp] = []
+        # Delete leaf_prefix_route entry.
+        match: dict[str, str | int] = {}
+        for idx, field_name in enumerate(
+            ("hdr.kvswitch.h0", "hdr.kvswitch.h1", "hdr.kvswitch.h2")
+        ):
+            value = prefix[idx] if idx < len(prefix) else 0
+            mask = 0xFFFFFFFF if idx < len(prefix) else 0
+            match[field_name] = f"0x{value:08x}&&&0x{mask:08x}"
+        ops.append(TableDeleteOp(
+            switch=leaf_switch, table="leaf_prefix_route",
+            match=match, priority=1,
+        ))
+        if old_map:
+            for bucket in old_map:
+                ops.append(TableDeleteOp(
+                    switch=leaf_switch, table="leaf_prefix_ecmp",
+                    match={
+                        "meta.leaf_prefix_ecmp_group": group_id,
+                        "meta.ecmp_bucket": bucket,
+                    },
+                ))
+        self._adapter.apply_ops(ops)
+        return ops
 
     def _apply_spine_eviction(
         self,
@@ -678,7 +736,7 @@ class SDNController:
         candidates.discard(worker_id)
 
         all_ops: list[SwitchOp] = []
-        # Clean up leaf rules on leaves that lost all local candidates.
+        # Clean up leaf ECMP group on leaves that lost all local candidates.
         evicted_leaf = self._workers[worker_id].leaf_switch
         remaining_on_leaf = any(
             self._workers[c].leaf_switch == evicted_leaf for c in candidates
@@ -686,11 +744,10 @@ class SDNController:
         if not remaining_on_leaf:
             tcam = self.leaf_tcams.get(evicted_leaf)
             if tcam is not None:
-                removed = tcam.remove(prefix)
-                if removed is not None:
-                    _, op = self._leaf_delete_op(prefix, removed.target_id)
-                    self._adapter.apply_ops([op])
-                    all_ops.append(op)
+                tcam.remove(prefix)
+                all_ops.extend(
+                    self._delete_leaf_prefix_ecmp_group(evicted_leaf, prefix)
+                )
 
         if candidates:
             hit_count = max(
@@ -700,15 +757,11 @@ class SDNController:
             all_ops.extend(self._maybe_install_leaf_rules(prefix, hit_count, now))
             return all_ops
 
-        # No candidates at all — remove from all leaves.
+        # No candidates at all — remove leaf ECMP groups from all leaves.
         self._leaf_locations.pop(prefix, None)
         for ls, tcam in self.leaf_tcams.items():
-            removed = tcam.remove(prefix)
-            if removed is None:
-                continue
-            _, op = self._leaf_delete_op(prefix, removed.target_id)
-            self._adapter.apply_ops([op])
-            all_ops.append(op)
+            tcam.remove(prefix)
+            all_ops.extend(self._delete_leaf_prefix_ecmp_group(ls, prefix))
         return all_ops
 
     def _schedule_coalesced_refresh(self) -> None:

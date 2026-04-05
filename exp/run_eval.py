@@ -551,6 +551,8 @@ def _start_workers(
     ttft_ms: float = 10.0,
     load_update_interval_ms: float = 500.0,
     load_update_delta: int = 500,
+    max_num_batched_tokens: int = 2048,
+    max_num_seqs: int = 4,
 ) -> None:
     """Start mock workers on all worker hosts."""
     for i in range(n_workers):
@@ -562,6 +564,8 @@ def _start_workers(
             f" --worker-id worker{i}"
             f" --load-update-interval-ms {load_update_interval_ms}"
             f" --load-update-delta {load_update_delta}"
+            f" --max-num-batched-tokens {max_num_batched_tokens}"
+            f" --max-num-seqs {max_num_seqs}"
         )
         if base_ttft_ms is not None and per_token_ttft_ms is not None:
             cmd += f" --base-ttft-ms {base_ttft_ms} --per-token-ttft-ms {per_token_ttft_ms}"
@@ -928,7 +932,6 @@ def run_baseline_kvswitch(
     base_ttft_ms: float | None = None,
     per_token_ttft_ms: float | None = None,
     admission_threshold: int = 2,
-    reroute_score_threshold: float = 50.0,
 ) -> list[RequestMetric]:
     """KVSwitch: SDN controller populates TCAM; switches route shim-header traffic."""
     logger.info("--- Baseline: KVSwitch ---")
@@ -944,7 +947,6 @@ def run_baseline_kvswitch(
             spine_switches=topo.spine_names,
             coalesce_interval_s=2.0,
             admission_threshold=admission_threshold,
-            reroute_score_threshold=reroute_score_threshold,
         )
         controller_runtime.run(controller.start())
         logger.info(
@@ -1095,7 +1097,6 @@ def main() -> None:
         help="Drop KVSwitch requests whose UDP payload exceeds this size in bytes",
     )
     parser.add_argument("--admission-threshold", type=int, default=2)
-    parser.add_argument("--reroute-threshold", type=float, default=50.0)
     parser.add_argument("--output-dir", type=str, default="results/eval")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log-level", type=str, default="INFO")
@@ -1295,7 +1296,6 @@ def main() -> None:
                     base_ttft_ms=base_ttft_ms,
                     per_token_ttft_ms=per_token_ttft_ms,
                     admission_threshold=args.admission_threshold,
-                    reroute_score_threshold=args.reroute_threshold,
                 )
             else:
                 continue

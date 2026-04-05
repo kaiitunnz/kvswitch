@@ -123,14 +123,14 @@ def test_controller_installs_reroutes_and_deletes_leaf_rules_on_correct_switch()
         op.match.get("hdr.kvswitch.h0") == "0x00000001&&&0xffffffff"
         for op in leaf_deletes
     )
-    # New leaf rule for other_prefix should be added.
+    # New leaf rule for other_prefix should be added (set_leaf_prefix_ecmp_group).
     new_leaf_adds = [
         op
         for op in eviction_ops
         if isinstance(op, TableAddOp) and op.table == "leaf_prefix_route"
     ]
     assert any(
-        op.action_params["port"] == 1
+        "group_id" in op.action_params
         and op.match.get("hdr.kvswitch.h0") == "0x00000009&&&0xffffffff"
         for op in new_leaf_adds
     )
@@ -619,7 +619,6 @@ def test_score_conditional_reroute_on_queue_update() -> None:
         admission_threshold=1,
         adapter=adapter,
         spine_switches=["s1"],
-        reroute_score_threshold=50.0,
     )
 
     # Install prefix on both workers (cross-leaf).
