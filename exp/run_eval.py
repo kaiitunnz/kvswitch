@@ -14,6 +14,7 @@ import logging
 import shlex
 import statistics
 import sys
+from dataclasses import dataclass
 import threading
 import time
 from collections import defaultdict
@@ -34,7 +35,7 @@ from kvswitch.controller.finsy_adapter import FinsyAdapter
 from kvswitch.controller.sdn_controller import (
     ECMP_BUCKETS,
     SDNController,
-    parse_worker_placements,
+    WorkerPlacement,
 )
 from kvswitch.controller.switch_adapter import SwitchOp, TableAddOp, TableClearOp
 from kvswitch.eval.metrics import (
@@ -51,11 +52,11 @@ from kvswitch.eval.workload import (
 from kvswitch.network.bmv2 import BMv2Switch, reset_device_ids
 from kvswitch.network.control_plane import ControlPlane
 from kvswitch.network.topology import (
+    CLOS_ROUTER_IP,
     KVSWITCH_SERVICE_IP,
     KVSWITCH_SERVICE_MAC,
-    ROUTER_IP,
-    BMv2SpineLeafTopo,
-    worker_ip,
+    ClosTopology,
+    clos_worker_ip,
 )
 from kvswitch.sdk.client import KVSWITCH_UDP_PORT
 from kvswitch.sdk.header import HEADER_SIZE
@@ -71,6 +72,17 @@ CONTROLLER_PORT = 9100
 
 HEALTHCHECK_MODULE = "kvswitch.network.cli.healthcheck"
 WORKLOAD_CLIENT_MODULE = "kvswitch.network.cli.workload_client"
+
+
+@dataclass
+class TopoConfig:
+    """Derived topology metadata for passing to baselines."""
+
+    n_workers: int
+    workers_per_leaf: int
+    n_worker_leaves: int
+    spine_names: list[str]
+    placements: list[WorkerPlacement]
 
 
 def _module_cmd(module: str, **kwargs: str | int | float) -> str:
@@ -198,42 +210,39 @@ def _switch_runtime_config(net: Mininet) -> tuple[dict[str, str], dict[str, int]
 def _populate_ipv4_routes(net: Mininet, adapter: FinsyAdapter) -> None:
     """Populate ipv4_lpm tables on all BMv2 switches and static ARP on hosts.
 
-    Each switch gets LPM rules that map host IP prefixes to the correct
-    egress port. Each host gets static ARP entries for all other hosts
-    (since ARP broadcast is not handled by the P4 program).
+    For each switch port, discovers hosts reachable within one hop
+    (directly connected or on the immediate neighbor switch) and installs
+    /32 LPM routes.  This is correct for two-tier Clos topologies where
+    any host is at most 2 switch hops from any switch.
     """
-    # Collect host IP → MAC mappings and figure out which switch port
-    # each host is connected to.
-    host_info: dict[str, tuple[str, str]] = {}  # name -> (ip, mac)
+    host_info: dict[str, tuple[str, str]] = {}
     for h in net.hosts:
         ip = h.IP()
         mac = h.MAC()
         if ip and mac:
             host_info[h.name] = (ip, mac)
 
-    # For each switch, find which port leads to which host (or to the other switch).
     sw: Switch
-    intf: Intf
     for sw in net.switches:
         ops: list[TableAddOp] = []
+        installed_ips: set[str] = set()
         for port_num, intf in enumerate(sw.intfList()):
             if intf.name == "lo":
                 continue
             link = cast(Link | None, intf.link)
             if link is None:
                 continue
-            # The other end of this link.
             other_intf = link.intf1 if link.intf2 == intf else link.intf2
-            assert other_intf is not None
             other_node = cast(Node, other_intf.node)
 
             if other_node in net.hosts:
-                # Direct host connection — add /32 LPM rule.
+                # Directly connected host.
                 ip = other_node.IP()
-                if ip:
+                if ip and ip not in installed_ips:
+                    installed_ips.add(ip)
                     ops.append(
                         TableAddOp(
-                            switch=sw.name,  # type: ignore[arg-type]
+                            switch=sw.name,
                             table="ipv4_lpm",
                             action="forward",
                             match={"hdr.ipv4.dstAddr": f"{ip}/32"},
@@ -241,26 +250,59 @@ def _populate_ipv4_routes(net: Mininet, adapter: FinsyAdapter) -> None:
                         )
                     )
             else:
-                # Connection to another switch — add default route via
-                # this port for any IP not matched by a /32 rule.
-                # We add /8 as a catch-all since all hosts are in 10.0.0.0/24.
-                ops.append(
-                    TableAddOp(
-                        switch=sw.name,  # type: ignore[arg-type]
-                        table="ipv4_lpm",
-                        action="forward",
-                        match={"hdr.ipv4.dstAddr": "10.0.0.0/8"},
-                        action_params={"port": port_num},
-                    )
-                )
-
+                # Neighbor switch — add routes for hosts on it and on
+                # its own neighbor switches (2-hop reach).  In a 2-tier
+                # Clos this covers ingress→spine→leaf→worker paths.
+                neighbor = cast(Switch, other_node)
+                hop2_switches: list[Switch] = [neighbor]
+                for _, n_intf in enumerate(neighbor.intfList()):
+                    if n_intf.name == "lo":
+                        continue
+                    n_link = cast(Link | None, n_intf.link)
+                    if n_link is None:
+                        continue
+                    n_peer = n_link.intf1 if n_link.intf2 == n_intf else n_link.intf2
+                    n_node = cast(Node, n_peer.node)
+                    if n_node not in net.hosts and n_node != sw:
+                        hop2_switches.append(cast(Switch, n_node))
+                for hop_sw in hop2_switches:
+                    for _, h_intf in enumerate(hop_sw.intfList()):
+                        if h_intf.name == "lo":
+                            continue
+                        h_link = cast(Link | None, h_intf.link)
+                        if h_link is None:
+                            continue
+                        h_peer = h_link.intf1 if h_link.intf2 == h_intf else h_link.intf2
+                        h_node = cast(Node, h_peer.node)
+                        if h_node in net.hosts:
+                            ip = h_node.IP()
+                            if ip and ip not in installed_ips:
+                                installed_ips.add(ip)
+                                ops.append(
+                                    TableAddOp(
+                                        switch=sw.name,
+                                        table="ipv4_lpm",
+                                        action="forward",
+                                        match={"hdr.ipv4.dstAddr": f"{ip}/32"},
+                                        action_params={"port": port_num},
+                                    )
+                                )
         if ops:
             adapter.apply_ops(ops)
 
     for h in net.hosts:
+        default_intf = h.defaultIntf()
+        intf_name = default_intf.name if default_intf is not None else "lo"
         for other_name, (other_ip, other_mac) in host_info.items():
             if other_name != h.name:
-                h.cmd(f"arp -s {other_ip} {other_mac}")
+                # ip neigh works across subnets; arp -s may silently fail.
+                h.cmd(
+                    f"ip neigh replace {other_ip} lladdr {other_mac}"
+                    f" dev {intf_name} nud permanent"
+                )
+        # Default route for cross-subnet traffic in per-leaf topologies.
+        if default_intf is not None:
+            h.cmd(f"ip route add default dev {intf_name} 2>/dev/null || true")
 
     logger.info("Populated ipv4_lpm routes and static ARP on %d hosts", len(net.hosts))
 
@@ -498,6 +540,7 @@ def _get_node(net: Mininet, name: str) -> Node:
 def _start_workers(
     net: Mininet,
     n_workers: int,
+    workers_per_leaf: int,
     tpot_ms: float,
     max_output_tokens: int,
     controller_host: str | None = None,
@@ -531,53 +574,59 @@ def _start_workers(
     # Wait for all workers to be ready.
     client = _get_node(net, "client")
     for i in range(n_workers):
-        _wait_for_service(client, worker_ip(i), WORKER_PORT)
+        leaf_idx = i // workers_per_leaf
+        worker_idx = i % workers_per_leaf
+        _wait_for_service(client, clos_worker_ip(leaf_idx, worker_idx), WORKER_PORT)
 
 
-def _controller_workers_arg(net: Mininet, n_workers: int) -> str:
-    """Build the controller worker-placement argument from the live Mininet topology."""
-    spine = _get_node(net, "s1")
-    leaf = _get_node(net, "s2")
-
-    spine_port_to_leaf = None
-    for port_num, intf in enumerate(spine.intfList()):
-        if intf.name == "lo" or intf.link is None:
+def _find_port(sw: Node, target: Node) -> int:
+    """Return the port number on *sw* that connects to *target*."""
+    for port_num, intf in enumerate(sw.intfList()):
+        if intf.name == "lo":
             continue
-        other_intf = intf.link.intf1 if intf.link.intf2 == intf else intf.link.intf2
-        if other_intf.node == leaf:
-            spine_port_to_leaf = port_num
-            break
-    if spine_port_to_leaf is None:
-        raise RuntimeError("failed to determine spine port connected to leaf switch")
+        link = cast(Link | None, intf.link)
+        if link is None:
+            continue
+        other = link.intf1 if link.intf2 == intf else link.intf2
+        if cast(Node, other.node) == target:
+            return port_num
+    raise RuntimeError(f"no link from {sw.name} to {target.name}")
 
-    worker_specs: list[str] = []
+
+def _build_worker_placements(
+    net: Mininet,
+    n_workers: int,
+    workers_per_leaf: int,
+    n_worker_leaves: int,
+    spine_names: list[str],
+) -> list[WorkerPlacement]:
+    """Discover per-worker placement from the live Clos topology."""
+
+    placements: list[WorkerPlacement] = []
     for i in range(n_workers):
-        worker = _get_node(net, f"worker{i}")
-        leaf_port = None
-        for port_num, intf in enumerate(leaf.intfList()):
-            if intf.name == "lo" or intf.link is None:
-                continue
-            other_intf = intf.link.intf1 if intf.link.intf2 == intf else intf.link.intf2
-            if other_intf.node == worker:
-                leaf_port = port_num
-                break
-        if leaf_port is None:
-            raise RuntimeError(f"failed to determine leaf port for worker{i}")
+        leaf_idx = i // workers_per_leaf
+        worker_idx = i % workers_per_leaf
+        leaf_name = f"leaf{leaf_idx}"
+        leaf_node = _get_node(net, leaf_name)
+        worker_node = _get_node(net, f"worker{i}")
+        leaf_port = _find_port(leaf_node, worker_node)
 
-        worker_specs.append(
-            ",".join(
-                [
-                    f"worker{i}",
-                    "s2",
-                    worker_ip(i),
-                    worker.MAC(),
-                    str(spine_port_to_leaf),
-                    str(leaf_port),
-                ]
+        spine_ports: dict[str, int] = {}
+        for sp_name in spine_names:
+            sp_node = _get_node(net, sp_name)
+            spine_ports[sp_name] = _find_port(sp_node, leaf_node)
+
+        placements.append(
+            WorkerPlacement(
+                worker_id=f"worker{i}",
+                leaf_switch=leaf_name,
+                worker_ip=clos_worker_ip(leaf_idx, worker_idx),
+                worker_mac=worker_node.MAC(),
+                leaf_port=leaf_port,
+                spine_ports=spine_ports,
             )
         )
-
-    return ";".join(worker_specs)
+    return placements
 
 
 def _stop_workers(net: Mininet, n_workers: int) -> None:
@@ -587,75 +636,84 @@ def _stop_workers(net: Mininet, n_workers: int) -> None:
 
 def _program_uniform_ecmp(
     net: Mininet,
-    n_workers: int,
+    placements: list[WorkerPlacement],
+    spine_names: list[str],
     adapter: FinsyAdapter,
 ) -> None:
-    """Program uniform ECMP tables on spine and leaf for L4 round-robin."""
-    spine = _get_node(net, "s1")
-    leaf = _get_node(net, "s2")
+    """Program uniform ECMP tables on all spines and leaves for L4 round-robin."""
 
-    # Find spine → leaf port.
-    spine_port_to_leaf: int | None = None
-    for port_num, intf in enumerate(spine.intfList()):
-        if intf.name == "lo" or intf.link is None:
-            continue
-        other = intf.link.intf1 if intf.link.intf2 == intf else intf.link.intf2
-        if other.node == leaf:
-            spine_port_to_leaf = port_num
-            break
-    if spine_port_to_leaf is None:
-        raise RuntimeError("cannot find spine→leaf port")
-
-    # Spine ECMP: all buckets → single leaf (only one pod).
-    spine_ops: list[SwitchOp] = [TableClearOp(switch="s1", table="spine_ecmp_select")]
-    for bucket in range(ECMP_BUCKETS):
-        spine_ops.append(
-            TableAddOp(
-                switch="s1",
-                table="spine_ecmp_select",
-                action="route_to_pod",
-                match={"meta.ecmp_bucket": bucket},
-                action_params={"port": spine_port_to_leaf},
+    # --- Spine ECMP: distribute buckets across worker leaves ---
+    leaf_names = sorted({p.leaf_switch for p in placements})
+    for sp_name in spine_names:
+        ops: list[SwitchOp] = [
+            TableClearOp(switch=sp_name, table="spine_ecmp_select")
+        ]
+        for bucket in range(ECMP_BUCKETS):
+            leaf_name = leaf_names[bucket % len(leaf_names)]
+            # Find the spine port leading to this leaf.
+            port = next(p.spine_ports[sp_name] for p in placements if p.leaf_switch == leaf_name)
+            ops.append(
+                TableAddOp(
+                    switch=sp_name,
+                    table="spine_ecmp_select",
+                    action="route_to_pod",
+                    match={"meta.ecmp_bucket": bucket},
+                    action_params={"port": port},
+                )
             )
-        )
-    adapter.apply_ops(spine_ops)
+        adapter.apply_ops(ops)
 
-    # Leaf ECMP: distribute buckets evenly across workers.
-    leaf_ops: list[SwitchOp] = [TableClearOp(switch="s2", table="leaf_ecmp_select")]
-    for bucket in range(ECMP_BUCKETS):
-        worker_idx = bucket % n_workers
-        worker = _get_node(net, f"worker{worker_idx}")
-        leaf_port: int | None = None
-        for port_num, intf in enumerate(leaf.intfList()):
-            if intf.name == "lo" or intf.link is None:
-                continue
-            other = intf.link.intf1 if intf.link.intf2 == intf else intf.link.intf2
-            if other.node == worker:
-                leaf_port = port_num
-                break
-        if leaf_port is None:
-            raise RuntimeError(f"cannot find leaf port for worker{worker_idx}")
-        leaf_ops.append(
-            TableAddOp(
-                switch="s2",
-                table="leaf_ecmp_select",
-                action="route_to_worker",
-                match={"meta.ecmp_bucket": bucket},
-                action_params={
-                    "port": leaf_port,
-                    "dst_mac": int(worker.MAC().replace(":", ""), 16),
-                },
+    # --- Leaf ECMP: distribute buckets across local workers ---
+    workers_by_leaf: dict[str, list[WorkerPlacement]] = defaultdict(list)
+    for p in placements:
+        workers_by_leaf[p.leaf_switch].append(p)
+    for leaf_name, leaf_workers in workers_by_leaf.items():
+        ops = [TableClearOp(switch=leaf_name, table="leaf_ecmp_select")]
+        for bucket in range(ECMP_BUCKETS):
+            w = leaf_workers[bucket % len(leaf_workers)]
+            ops.append(
+                TableAddOp(
+                    switch=leaf_name,
+                    table="leaf_ecmp_select",
+                    action="route_to_worker",
+                    match={"meta.ecmp_bucket": bucket},
+                    action_params={
+                        "port": w.leaf_port,
+                        "dst_mac": int(w.worker_mac.replace(":", ""), 16),
+                    },
+                )
             )
-        )
-    adapter.apply_ops(leaf_ops)
+        adapter.apply_ops(ops)
+
+    # --- Ingress ECMP: distribute buckets across spines ---
+    ingress_switches = [sw for sw in net.switches if sw.name.startswith("ingress")]
+    for ing in ingress_switches:
+        ops = [TableClearOp(switch=ing.name, table="spine_ecmp_select")]
+        for bucket in range(ECMP_BUCKETS):
+            sp_name = spine_names[bucket % len(spine_names)]
+            sp_port = _find_port(ing, _get_node(net, sp_name))
+            ops.append(
+                TableAddOp(
+                    switch=ing.name,
+                    table="spine_ecmp_select",
+                    action="route_to_pod",
+                    match={"meta.ecmp_bucket": bucket},
+                    action_params={"port": sp_port},
+                )
+            )
+        adapter.apply_ops(ops)
+
     logger.info(
-        "Programmed uniform ECMP tables for L4 round-robin (%d workers)", n_workers
+        "Programmed uniform ECMP: %d spines, %d leaves, %d workers",
+        len(spine_names),
+        len(leaf_names),
+        len(placements),
     )
 
 
 def run_baseline_l4_rr(
     net: Mininet,
-    n_workers: int,
+    topo: TopoConfig,
     ttft_ms: float,
     tpot_ms: float,
     max_output_tokens: int,
@@ -668,15 +726,13 @@ def run_baseline_l4_rr(
     """L4 Round-Robin: uniform ECMP distributes traffic via KVSwitch VIP."""
     logger.info("--- Baseline: L4 Round-Robin ---")
 
-    # Configure the KVSwitch virtual service (VIP + MAC) and program
-    # uniform ECMP tables — same datapath as KVSwitch but without
-    # prefix-aware rules.
-    _configure_kvswitch_service(net, n_workers)
-    _program_uniform_ecmp(net, n_workers, adapter)
+    _configure_kvswitch_service(net, topo.n_workers)
+    _program_uniform_ecmp(net, topo.placements, topo.spine_names, adapter)
 
     _start_workers(
         net,
-        n_workers,
+        topo.n_workers,
+        topo.workers_per_leaf,
         tpot_ms,
         max_output_tokens,
         kvswitch_port=KVSWITCH_UDP_PORT,
@@ -712,13 +768,13 @@ def run_baseline_l4_rr(
         kvswitch=True,
     )
 
-    _stop_workers(net, n_workers)
+    _stop_workers(net, topo.n_workers)
     return _to_request_metrics(raw, "l4_rr")
 
 
 def run_baseline_l7(
     net: Mininet,
-    n_workers: int,
+    topo: TopoConfig,
     ttft_ms: float,
     tpot_ms: float,
     max_output_tokens: int,
@@ -732,7 +788,8 @@ def run_baseline_l7(
     logger.info("--- Baseline: L7 Prefix-Aware Router ---")
     _start_workers(
         net,
-        n_workers,
+        topo.n_workers,
+        topo.workers_per_leaf,
         tpot_ms,
         max_output_tokens,
         base_ttft_ms=base_ttft_ms,
@@ -742,7 +799,7 @@ def run_baseline_l7(
 
     # Start L7 proxy on the router host.
     router_host = _get_node(net, "router")
-    workers_arg = ",".join(f"{worker_ip(i)}:{WORKER_PORT}" for i in range(n_workers))
+    workers_arg = ",".join(f"{p.worker_ip}:{WORKER_PORT}" for p in topo.placements)
     proxy_log = "/tmp/l7_proxy.log"
     _start_bg(
         router_host,
@@ -757,7 +814,7 @@ def run_baseline_l7(
 
     client = _get_node(net, "client")
     try:
-        _wait_for_service(client, ROUTER_IP, ROUTER_PORT, timeout=120.0)
+        _wait_for_service(client, CLOS_ROUTER_IP, ROUTER_PORT, timeout=120.0)
     except TimeoutError:
         log_out = router_host.cmd(f"cat {proxy_log}")
         logger.error("L7 proxy log:\n%s", log_out)
@@ -773,17 +830,17 @@ def run_baseline_l7(
         _collect_results(
             client,
             warmup_path,
-            ROUTER_IP,
+            CLOS_ROUTER_IP,
             ROUTER_PORT,
             client_timeout,
         )
 
     raw = _collect_results(
-        client, workload_path, ROUTER_IP, ROUTER_PORT, client_timeout
+        client, workload_path, CLOS_ROUTER_IP, ROUTER_PORT, client_timeout
     )
 
     _kill_bg(router_host)
-    _stop_workers(net, n_workers)
+    _stop_workers(net, topo.n_workers)
     return _to_request_metrics(raw, "l7")
 
 
@@ -822,7 +879,7 @@ def _build_warmup_workload(workload_path: str, n_per_group: int = 2) -> list[dic
 
 def run_baseline_kvswitch(
     net: Mininet,
-    n_workers: int,
+    topo: TopoConfig,
     ttft_ms: float,
     tpot_ms: float,
     max_output_tokens: int,
@@ -836,21 +893,16 @@ def run_baseline_kvswitch(
 ) -> list[RequestMetric]:
     """KVSwitch: SDN controller populates TCAM; switches route shim-header traffic."""
     logger.info("--- Baseline: KVSwitch ---")
-    _configure_kvswitch_service(net, n_workers)
+    _configure_kvswitch_service(net, topo.n_workers)
 
-    workers_arg = _controller_workers_arg(net, n_workers)
-    worker_placements = parse_worker_placements(workers_arg)
-
-    # Control-plane network — context manager guarantees cleanup even on error.
-    with ControlPlane(net, n_workers) as cp:
-        # Start the controller bound to the OOB bridge IP.
+    with ControlPlane(net, topo.n_workers) as cp:
         controller_ip = cp.controller_ip
         controller = SDNController(
-            workers=worker_placements,
+            workers=topo.placements,
             host=controller_ip,
             port=CONTROLLER_PORT,
             adapter=adapter,
-            spine_switch="s1",
+            spine_switches=topo.spine_names,
             coalesce_interval_s=2.0,
             admission_threshold=admission_threshold,
             reroute_score_threshold=0.2,
@@ -862,11 +914,11 @@ def run_baseline_kvswitch(
             CONTROLLER_PORT,
         )
 
-        # Workers send events directly to the OOB controller IP.
         client = _get_node(net, "client")
         _start_workers(
             net,
-            n_workers,
+            topo.n_workers,
+            topo.workers_per_leaf,
             tpot_ms,
             max_output_tokens,
             controller_host=controller_ip,
@@ -916,7 +968,7 @@ def run_baseline_kvswitch(
             )
         finally:
             controller.close()
-            _stop_workers(net, n_workers)
+            _stop_workers(net, topo.n_workers)
 
     return _to_request_metrics(raw, "kvswitch")
 
@@ -943,7 +995,9 @@ def main() -> None:
         default="l4_rr,l7,kvswitch",
         help="Comma-separated baselines: l4_rr, l7, kvswitch",
     )
-    parser.add_argument("--n-workers", type=int, default=4)
+    parser.add_argument("--n-spines", type=int, default=2)
+    parser.add_argument("--n-worker-leaves", type=int, default=1)
+    parser.add_argument("--workers-per-leaf", type=int, default=4)
     parser.add_argument("--num-requests", type=int, default=200)
     parser.add_argument("--request-rate", type=float, default=10.0)
     parser.add_argument("--prefix-sharing-ratio", type=float, default=0.5)
@@ -1093,19 +1147,32 @@ def main() -> None:
     # path or the compile output directory.
     p4_json_path, p4info_path, p4blob_path = _resolve_p4_artifacts(args.p4_json)
 
-    # --- Determine topology needs ---
+    # --- Topology parameters ---
+    n_spines = args.n_spines
+    n_worker_leaves = args.n_worker_leaves
+    workers_per_leaf = args.workers_per_leaf
+    n_workers = n_worker_leaves * workers_per_leaf
     needs_router = any(BASELINE_REGISTRY[b]["needs_router"] for b in baselines)
+    spine_names = [f"spine{i}" for i in range(n_spines)]
 
-    # --- Build and start topology ---
+    # --- Build and start Clos topology ---
     logger.info(
-        "Building BMv2 topology: %d workers, router=%s", args.n_workers, needs_router
+        "Building Clos topology: %d spines, %d worker leaves × %d workers, router=%s",
+        n_spines,
+        n_worker_leaves,
+        workers_per_leaf,
+        needs_router,
     )
     reset_device_ids()
-    topo = BMv2SpineLeafTopo(
-        n_workers=args.n_workers, with_router=needs_router, delay=args.delay
+    clos = ClosTopology(
+        n_spines=n_spines,
+        n_worker_leaves=n_worker_leaves,
+        workers_per_leaf=workers_per_leaf,
+        with_router=needs_router,
+        delay=args.delay,
     )
     net = Mininet(
-        topo=topo,
+        topo=clos,
         switch=lambda name, **kw: BMv2Switch(name, json_path=p4_json_path, **kw),  # type: ignore
         link=TCLink,
         controller=None,
@@ -1126,6 +1193,17 @@ def main() -> None:
     controller_runtime.run(finsy_adapter.start())
     _populate_ipv4_routes(net, finsy_adapter)
 
+    placements = _build_worker_placements(
+        net, n_workers, workers_per_leaf, n_worker_leaves, spine_names
+    )
+    topo_config = TopoConfig(
+        n_workers=n_workers,
+        workers_per_leaf=workers_per_leaf,
+        n_worker_leaves=n_worker_leaves,
+        spine_names=spine_names,
+        placements=placements,
+    )
+
     net.pingAll()
 
     # --- Run each baseline ---
@@ -1135,7 +1213,7 @@ def main() -> None:
             if baseline == "l4_rr":
                 metrics = run_baseline_l4_rr(
                     net,
-                    args.n_workers,
+                    topo_config,
                     ttft_ms,
                     tpot_ms,
                     args.max_output_tokens,
@@ -1148,7 +1226,7 @@ def main() -> None:
             elif baseline == "l7":
                 metrics = run_baseline_l7(
                     net,
-                    args.n_workers,
+                    topo_config,
                     ttft_ms,
                     tpot_ms,
                     args.max_output_tokens,
@@ -1161,7 +1239,7 @@ def main() -> None:
             elif baseline == "kvswitch":
                 metrics = run_baseline_kvswitch(
                     net,
-                    args.n_workers,
+                    topo_config,
                     ttft_ms,
                     tpot_ms,
                     args.max_output_tokens,
@@ -1201,7 +1279,10 @@ def main() -> None:
 
     config = {
         "baselines": baselines,
-        "n_workers": args.n_workers,
+        "n_spines": n_spines,
+        "n_worker_leaves": n_worker_leaves,
+        "workers_per_leaf": workers_per_leaf,
+        "n_workers": n_workers,
         "num_requests": args.num_requests,
         "request_rate": args.request_rate,
         "prefix_sharing_ratio": args.prefix_sharing_ratio,
