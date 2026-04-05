@@ -14,7 +14,10 @@ The worker maintains two related but distinct views of prefix state:
 """
 
 import asyncio
+import json
 import logging
+import socket
+import time
 from collections import OrderedDict
 from typing import Any, Final
 
@@ -26,7 +29,7 @@ from kvswitch.utils.prefix import (
     normalize_prefix_hashes,
     prefix_chain,
 )
-from kvswitch.utils.udp import UDPClient, UDPRequest, UDPResponse, UDPServer
+from kvswitch.utils.udp import UDPRequest, UDPResponse, UDPServer
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +59,7 @@ class MockWorker:
         kvswitch_port: int | None = None,
         base_ttft_ms: float | None = None,
         per_token_ttft_ms: float | None = None,
+        load_update_interval_s: float = 0.0,
     ) -> None:
         self.host = host
         self.port = port
@@ -73,6 +77,8 @@ class MockWorker:
         self.controller_port = controller_port
         self.max_cached_prefixes = max_cached_prefixes
         self.kvswitch_port = kvswitch_port
+        self._load_update_interval_s = load_update_interval_s
+        self._last_load_update_time: float = 0.0
 
         self._capacity_cond = asyncio.Condition()
         self._active: int = 0
@@ -83,6 +89,7 @@ class MockWorker:
         self._export_prefix_cache: OrderedDict[tuple[int, ...], None] = OrderedDict()
         self._server = UDPServer(host=host, port=port, handler=self._handle)
         self._kvswitch_transport: asyncio.DatagramTransport | None = None
+        self._event_sock: socket.socket | None = None
 
     @staticmethod
     def _request_output_tokens(request: UDPRequest) -> int:
@@ -135,6 +142,16 @@ class MockWorker:
             return self._base_ttft_s + self._per_token_ttft_s * uncached_tokens
         return self.ttft_s
 
+    def _ensure_event_sock(self) -> socket.socket | None:
+        """Lazily create a persistent non-blocking UDP socket for events."""
+        if self.controller_host is None or self.controller_port is None:
+            return None
+        if self._event_sock is None:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setblocking(False)
+            self._event_sock = sock
+        return self._event_sock
+
     def _emit_event(
         self,
         event_type: str,
@@ -145,8 +162,13 @@ class MockWorker:
         queued_requests: int | None = None,
         queued_batched_tokens: int | None = None,
     ) -> None:
-        """Fire-and-forget a cache event to the SDN controller."""
-        if self.controller_host is None or self.controller_port is None:
+        """Fire-and-forget a cache event to the SDN controller.
+
+        Uses a persistent non-blocking UDP socket with no response wait.
+        This avoids per-event socket creation and asyncio contention.
+        """
+        sock = self._ensure_event_sock()
+        if sock is None:
             return
         payload: dict[str, Any] = {
             "endpoint": "cache_event",
@@ -166,20 +188,13 @@ class MockWorker:
         if queued_batched_tokens is not None:
             payload["queued_batched_tokens"] = queued_batched_tokens
 
-        asyncio.ensure_future(self._send_event(payload))
-
-    async def _send_event(self, payload: dict[str, Any]) -> None:
-        client = UDPClient(
-            host=self.controller_host,  # type: ignore[arg-type]
-            port=self.controller_port,  # type: ignore[arg-type]
-            timeout=2.0,
-        )
+        data = json.dumps(payload).encode("utf-8")
         try:
-            await client.send(payload)
-        except Exception:
-            logger.warning(
+            sock.sendto(data, (self.controller_host, self.controller_port))
+        except OSError:
+            logger.debug(
                 "Failed to emit %s event from worker %s",
-                payload.get("event_type"),
+                event_type,
                 self.worker_id,
                 exc_info=True,
             )
@@ -187,7 +202,14 @@ class MockWorker:
     def _load_metric(self) -> int:
         return self._active_batched_tokens + self._queued_batched_tokens
 
-    def _emit_load_update(self) -> None:
+    def _emit_load_update(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if (
+            not force
+            and (now - self._last_load_update_time) < self._load_update_interval_s
+        ):
+            return
+        self._last_load_update_time = now
         self._emit_event(
             "queue_update",
             load=self._load_metric(),
@@ -255,7 +277,7 @@ class MockWorker:
             self._local_block_cache[block_hash] = None
 
     def _update_export_prefix_cache(self, prefix_hashes: list[int]) -> None:
-        for prefix in prefix_chain(prefix_hashes):
+        for prefix in prefix_chain(prefix_hashes, max_hashes=3):
             if prefix in self._export_prefix_cache:
                 self._export_prefix_cache.move_to_end(prefix)
                 continue
@@ -374,7 +396,7 @@ class MockWorker:
                 self.kvswitch_port,
             )
 
-        self._emit_load_update()
+        self._emit_load_update(force=True)
         if self._base_ttft_s is not None and self._per_token_ttft_s is not None:
             ttft_desc = f"base_ttft={self._base_ttft_s*1000:.1f}ms + {self._per_token_ttft_s*1000:.5f}ms/token"
         else:
@@ -395,6 +417,9 @@ class MockWorker:
         self._server.close()
         if self._kvswitch_transport is not None:
             self._kvswitch_transport.close()
+        if self._event_sock is not None:
+            self._event_sock.close()
+            self._event_sock = None
 
     async def run_forever(self) -> None:
         await self.start()
@@ -449,6 +474,12 @@ if __name__ == "__main__":
         default=None,
         help="Marginal TTFT per uncached token (enables linear TTFT model)",
     )
+    parser.add_argument(
+        "--load-update-interval-ms",
+        type=float,
+        default=0.0,
+        help="Minimum interval between load-update emissions (ms)",
+    )
     parser.add_argument("--log-level", type=str, default="INFO")
     args = parser.parse_args()
 
@@ -469,5 +500,6 @@ if __name__ == "__main__":
             kvswitch_port=args.kvswitch_port,
             base_ttft_ms=args.base_ttft_ms,
             per_token_ttft_ms=args.per_token_ttft_ms,
+            load_update_interval_s=args.load_update_interval_ms / 1000.0,
         ).run_forever()
     )
