@@ -13,7 +13,6 @@ import json
 import logging
 import shlex
 import statistics
-import subprocess
 import sys
 import threading
 import time
@@ -52,7 +51,6 @@ from kvswitch.eval.workload import (
 from kvswitch.network.bmv2 import BMv2Switch, reset_device_ids
 from kvswitch.network.control_plane import ControlPlane
 from kvswitch.network.topology import (
-    CONTROLLER_IP,
     KVSWITCH_SERVICE_IP,
     KVSWITCH_SERVICE_MAC,
     ROUTER_IP,
@@ -70,11 +68,9 @@ PYTHON = sys.executable
 WORKER_PORT = 8000
 ROUTER_PORT = 9000
 CONTROLLER_PORT = 9100
-ROOT_NS_CONTROLLER_IP = "10.0.0.254"
 
 HEALTHCHECK_MODULE = "kvswitch.network.cli.healthcheck"
 WORKLOAD_CLIENT_MODULE = "kvswitch.network.cli.workload_client"
-CONTROLLER_RELAY_MODULE = "kvswitch.network.cli.udp_relay"
 
 
 def _module_cmd(module: str, **kwargs: str | int | float) -> str:
@@ -791,67 +787,6 @@ def run_baseline_l7(
     return _to_request_metrics(raw, "l7")
 
 
-def _setup_root_ns_controller_ip(net: Mininet, root_ns_ip: str) -> str | None:
-    """Assign a root-namespace upstream IP on the controller link.
-
-    The Mininet ``controller`` host owns ``CONTROLLER_IP`` and receives cache
-    events from workers. A small UDP relay on that host forwards events to the
-    in-process SDN controller, which runs in root namespace. This helper assigns
-    a distinct root-namespace IP on the switch-side veth so the relay has an
-    unambiguous upstream destination.
-
-    Returns the root-namespace interface name, or None on failure.
-    """
-    ctrl_host = _get_node(net, "controller")
-    if ctrl_host is None:
-        return None
-
-    ctrl_intf = ctrl_host.defaultIntf()
-    if ctrl_intf is None or ctrl_intf.link is None:
-        return None
-
-    # Find the switch-side interface of the controller's link.
-    link = ctrl_intf.link
-    switch_intf = link.intf1 if link.intf2 == ctrl_intf else link.intf2
-    switch_intf_name = switch_intf.name
-
-    # Add the controller IP to the switch-side interface in root namespace.
-    subprocess.run(
-        ["ip", "addr", "add", f"{root_ns_ip}/24", "dev", switch_intf_name],
-        capture_output=True,
-    )
-    logger.info(
-        "Assigned root-ns controller upstream IP %s to interface %s",
-        root_ns_ip,
-        switch_intf_name,
-    )
-    return switch_intf_name
-
-
-def _start_controller_relay(
-    net: Mininet,
-    upstream_host: str,
-    upstream_port: int,
-) -> tuple[Node, str]:
-    """Start a UDP relay in the Mininet controller host.
-
-    Workers send cache events to ``CONTROLLER_IP`` inside Mininet. The relay
-    forwards those requests to the in-process SDN controller running in root
-    namespace at ``upstream_host:upstream_port`` and returns the response.
-    """
-    controller_host = _get_node(net, "controller")
-    relay_log = "/tmp/controller_relay.log"
-    cmd = (
-        f"{PYTHON} -m {CONTROLLER_RELAY_MODULE}"
-        f" --host {CONTROLLER_IP} --port {CONTROLLER_PORT}"
-        f" --upstream-host {upstream_host} --upstream-port {upstream_port}"
-        f" --mode proxy"
-        f" > {relay_log} 2>&1"
-    )
-    _start_bg(controller_host, cmd)
-    return controller_host, relay_log
-
-
 def _build_warmup_workload(workload_path: str, n_per_group: int = 2) -> list[dict]:
     """Pick representative requests per prefix group for warm-up.
 
@@ -992,9 +927,9 @@ def run_baseline_kvswitch(
 
 
 BASELINE_REGISTRY = {
-    "l4_rr": {"needs_router": False, "needs_controller": False},
-    "l7": {"needs_router": True, "needs_controller": False},
-    "kvswitch": {"needs_router": False, "needs_controller": False},
+    "l4_rr": {"needs_router": False},
+    "l7": {"needs_router": True},
+    "kvswitch": {"needs_router": False},
 }
 
 
@@ -1160,21 +1095,14 @@ def main() -> None:
 
     # --- Determine topology needs ---
     needs_router = any(BASELINE_REGISTRY[b]["needs_router"] for b in baselines)
-    needs_controller = any(BASELINE_REGISTRY[b]["needs_controller"] for b in baselines)
 
     # --- Build and start topology ---
     logger.info(
-        "Building BMv2 topology: %d workers, router=%s, controller=%s",
-        args.n_workers,
-        needs_router,
-        needs_controller,
+        "Building BMv2 topology: %d workers, router=%s", args.n_workers, needs_router
     )
     reset_device_ids()
     topo = BMv2SpineLeafTopo(
-        n_workers=args.n_workers,
-        with_router=needs_router,
-        with_controller=needs_controller,
-        delay=args.delay,
+        n_workers=args.n_workers, with_router=needs_router, delay=args.delay
     )
     net = Mininet(
         topo=topo,

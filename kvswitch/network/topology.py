@@ -6,8 +6,8 @@
 
 **BMv2 topology (all baselines — P4 switches)**::
 
-              [router?]  [controller?]
-                 |            |
+              [router?]
+                 |
     [client] --- [spine] --- [leaf] --- [worker0..N]
 
 Run with: ``sudo python -m kvswitch.network.topology``
@@ -25,7 +25,6 @@ logger = logging.getLogger(__name__)
 
 CLIENT_IP = "10.0.0.100"
 ROUTER_IP = "10.0.0.200"
-CONTROLLER_IP = "10.0.0.201"
 KVSWITCH_SERVICE_IP = "10.0.0.250"
 KVSWITCH_SERVICE_MAC = "02:00:00:00:00:fa"
 
@@ -76,12 +75,12 @@ class BMv2SpineLeafTopo(Topo):
 
     All baselines share this topology.  For L4 RR the TCAM tables are
     empty so traffic hits ECMP fallback.  For KVSwitch the SDN controller
-    populates TCAM rules.
+    populates TCAM rules and uses a dedicated control-plane network
+    (see :class:`kvswitch.network.control_plane.ControlPlane`).
 
     Parameters (passed via ``build``):
         n_workers:       Number of worker hosts attached to the leaf.
         with_router:     Add an L7 router host (for the L7 baseline).
-        with_controller: Add an SDN controller host (for KVSwitch).
         delay:           Per-link latency string, e.g. ``"0.1ms"``.
     """
 
@@ -89,16 +88,12 @@ class BMv2SpineLeafTopo(Topo):
         self,
         n_workers: int = 4,
         with_router: bool = False,
-        with_controller: bool = False,
         delay: str | None = None,
     ) -> None:
         link_opts: dict = {}
         if delay is not None:
             link_opts["delay"] = delay
 
-        # BMv2 switches — Mininet builds them using the switch= class,
-        # so we just addSwitch here.  The actual BMv2Switch class is
-        # passed to Mininet() by the caller.
         spine = self.addSwitch("s1")
         leaf = self.addSwitch("s2")
         self.addLink(spine, leaf, **link_opts)
@@ -109,10 +104,6 @@ class BMv2SpineLeafTopo(Topo):
         if with_router:
             self.addHost("router", ip=f"{ROUTER_IP}/24")
             self.addLink("router", spine, **link_opts)
-
-        if with_controller:
-            self.addHost("controller", ip=f"{CONTROLLER_IP}/24")
-            self.addLink("controller", spine, **link_opts)
 
         for i in range(n_workers):
             self.addHost(f"worker{i}", ip=f"{worker_ip(i)}/24")
