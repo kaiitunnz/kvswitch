@@ -253,7 +253,7 @@ class SDNController:
             return UDPResponse(data={"error": f"unknown endpoint: {endpoint}"})
 
         event = CacheSyncEvent.from_payload(request.data)
-        logger.info("Received cache event: %s", self._describe_event(event))
+        logger.debug("Received cache event: %s", self._describe_event(event))
         ops = self.handle_event(event)
         return UDPResponse(data={"status": "ok", "n_ops": len(ops)})
 
@@ -432,28 +432,29 @@ class SDNController:
         candidates = self._spine_locations.get(prefix, set())
         if not candidates:
             return []
-        worker_id = self._select_worker(candidates)
         existing = self.spine_tcam.installed_rule(prefix)
-        if existing is not None and existing.target_id == worker_id:
-            self.spine_tcam.install(prefix, worker_id, hit_count=hit_count, now=now)
-            return []
 
-        # Hysteresis: only reroute when the new worker is significantly better
-        # than the current one.  Prevents flip-flopping on small load deltas.
-        if existing is not None and existing.target_id in candidates:
-            current_score = self._worker_score(existing.target_id)
-            new_score = self._worker_score(worker_id)
-            if new_score - current_score < self._reroute_score_threshold:
+        # Sticky prefix rules: once installed, keep the current owner.
+        # The owner already has the prefix cached; rerouting on alloc would
+        # send future requests to a potentially colder worker.  The rule
+        # only changes on eviction or when the owner is no longer a candidate.
+        if existing is not None:
+            if existing.target_id in candidates:
+                self.spine_tcam.install(
+                    prefix, existing.target_id, hit_count=hit_count, now=now
+                )
                 return []
+            # Current owner evicted the prefix — pick a new one.
 
-        previous_worker_id = existing.target_id if existing is not None else None
+        worker_id = self._select_worker(candidates)
         _, evicted = self.spine_tcam.install(
             prefix, worker_id, hit_count=hit_count, now=now
         )
         ops: list[SwitchOp] = []
+        previous_worker_id = existing.target_id if existing is not None else None
         if previous_worker_id is not None:
             ops.append(self._spine_delete_op(prefix))
-            logger.info(
+            logger.debug(
                 "Rerouting spine prefix rule prefix=%s old_worker=%s new_worker=%s switch=%s",
                 format_prefix_key(prefix),
                 previous_worker_id,
@@ -462,14 +463,14 @@ class SDNController:
             )
         if evicted is not None:
             ops.append(self._spine_delete_op(evicted[0]))
-            logger.info(
+            logger.debug(
                 "Evicting spine prefix rule prefix=%s previous_worker=%s",
                 format_prefix_key(evicted[0]),
                 evicted[1].target_id,
             )
         add_op = self._spine_add_op(prefix, worker_id)
         ops.append(add_op)
-        logger.info(
+        logger.debug(
             "Installing spine prefix rule prefix=%s worker=%s switch=%s",
             format_prefix_key(prefix),
             worker_id,
@@ -490,19 +491,17 @@ class SDNController:
         candidates = self._leaf_locations.get(prefix, set())
         if not candidates:
             return []
-        worker_id = self._select_worker(candidates)
         existing = self.leaf_tcam.installed_rule(prefix)
-        if existing is not None and existing.target_id == worker_id:
-            self.leaf_tcam.install(prefix, worker_id, hit_count=hit_count, now=now)
-            return []
 
-        # Hysteresis: only reroute when the new worker is significantly better.
-        if existing is not None and existing.target_id in candidates:
-            current_score = self._worker_score(existing.target_id)
-            new_score = self._worker_score(worker_id)
-            if new_score - current_score < self._reroute_score_threshold:
+        # Sticky: keep current owner if still a candidate.
+        if existing is not None:
+            if existing.target_id in candidates:
+                self.leaf_tcam.install(
+                    prefix, existing.target_id, hit_count=hit_count, now=now
+                )
                 return []
 
+        worker_id = self._select_worker(candidates)
         previous_worker_id = existing.target_id if existing is not None else None
         _, evicted = self.leaf_tcam.install(
             prefix, worker_id, hit_count=hit_count, now=now
@@ -514,7 +513,7 @@ class SDNController:
                 prefix, previous_worker_id
             )
             ops.append(delete_op)
-            logger.info(
+            logger.debug(
                 "Rerouting leaf prefix rule prefix=%s old_worker=%s new_worker=%s old_switch=%s new_switch=%s",
                 format_prefix_key(prefix),
                 previous_worker_id,
@@ -527,7 +526,7 @@ class SDNController:
                 evicted[0], evicted[1].target_id
             )
             self._adapter.apply_ops([evict_op])
-            logger.info(
+            logger.debug(
                 "Evicting leaf prefix rule prefix=%s previous_worker=%s switch=%s",
                 format_prefix_key(evicted[0]),
                 evicted[1].target_id,
@@ -535,7 +534,7 @@ class SDNController:
             )
             ops.append(evict_op)
         ops.append(add_op)
-        logger.info(
+        logger.debug(
             "Installing leaf prefix rule prefix=%s worker=%s switch=%s",
             format_prefix_key(prefix),
             worker_id,
@@ -561,7 +560,7 @@ class SDNController:
         if self.spine_tcam.remove(prefix) is None:
             return []
         op = self._spine_delete_op(prefix)
-        logger.info(
+        logger.debug(
             "Removing spine prefix rule prefix=%s switch=%s",
             format_prefix_key(prefix),
             self._spine_switch,
@@ -587,7 +586,7 @@ class SDNController:
         if removed is None:
             return []
         switch_name, op = self._leaf_delete_op(prefix, removed.target_id)
-        logger.info(
+        logger.debug(
             "Removing leaf prefix rule prefix=%s worker=%s switch=%s",
             format_prefix_key(prefix),
             removed.target_id,

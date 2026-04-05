@@ -509,7 +509,8 @@ def _start_workers(
     base_ttft_ms: float | None = None,
     per_token_ttft_ms: float | None = None,
     ttft_ms: float = 10.0,
-    load_update_interval_ms: float = 50.0,
+    load_update_interval_ms: float = 500.0,
+    load_update_delta: int = 500,
 ) -> None:
     """Start mock workers on all worker hosts."""
     for i in range(n_workers):
@@ -520,6 +521,7 @@ def _start_workers(
             f" --ttft-ms {ttft_ms} --tpot-ms {tpot_ms}"
             f" --worker-id worker{i}"
             f" --load-update-interval-ms {load_update_interval_ms}"
+            f" --load-update-delta {load_update_delta}"
         )
         if base_ttft_ms is not None and per_token_ttft_ms is not None:
             cmd += f" --base-ttft-ms {base_ttft_ms} --per-token-ttft-ms {per_token_ttft_ms}"
@@ -842,6 +844,7 @@ def _start_controller_relay(
         f"{PYTHON} -m {CONTROLLER_RELAY_MODULE}"
         f" --host {CONTROLLER_IP} --port {CONTROLLER_PORT}"
         f" --upstream-host {upstream_host} --upstream-port {upstream_port}"
+        f" --mode proxy"
         f" > {relay_log} 2>&1"
     )
     _start_bg(controller_host, cmd)
@@ -915,7 +918,7 @@ def run_baseline_kvswitch(
         port=CONTROLLER_PORT,
         adapter=adapter,
         spine_switch="s1",
-        coalesce_interval_s=0.5,
+        coalesce_interval_s=2.0,
         admission_threshold=admission_threshold,
         reroute_score_threshold=0.2,
     )
@@ -942,6 +945,14 @@ def run_baseline_kvswitch(
 
     # Start workers with controller connection and KVSwitch listener.
     client = _get_node(net, "client")
+    try:
+        _wait_for_service(client, CONTROLLER_IP, CONTROLLER_PORT, timeout=30.0)
+    except TimeoutError:
+        logger.error("Controller relay log:\n%s", relay_host.cmd(f"cat {relay_log}"))
+        _kill_bg(relay_host)
+        controller.close()
+        raise
+
     _start_workers(
         net,
         n_workers,
@@ -958,7 +969,7 @@ def run_baseline_kvswitch(
     # Warm-up: send requests to populate both TCAM prefix rules and worker
     # caches.  Workers stay running so switch and cache state are consistent.
     warmup_workload = _build_warmup_workload(
-        workload_path, n_per_group=max(admission_threshold, 2)
+        workload_path, n_per_group=max(admission_threshold, 10)
     )
     if warmup_workload:
         warmup_path = "/tmp/eval_warmup.json"

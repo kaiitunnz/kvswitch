@@ -60,6 +60,7 @@ class MockWorker:
         base_ttft_ms: float | None = None,
         per_token_ttft_ms: float | None = None,
         load_update_interval_s: float = 0.0,
+        load_update_delta: int = 0,
     ) -> None:
         self.host = host
         self.port = port
@@ -78,7 +79,9 @@ class MockWorker:
         self.max_cached_prefixes = max_cached_prefixes
         self.kvswitch_port = kvswitch_port
         self._load_update_interval_s = load_update_interval_s
+        self._load_update_delta = load_update_delta
         self._last_load_update_time: float = 0.0
+        self._last_emitted_load: int = 0
 
         self._capacity_cond = asyncio.Condition()
         self._active: int = 0
@@ -204,12 +207,14 @@ class MockWorker:
 
     def _emit_load_update(self, force: bool = False) -> None:
         now = time.monotonic()
-        if (
-            not force
-            and (now - self._last_load_update_time) < self._load_update_interval_s
-        ):
-            return
+        current_load = self._load_metric()
+        if not force:
+            if (now - self._last_load_update_time) < self._load_update_interval_s:
+                return
+            if abs(current_load - self._last_emitted_load) < self._load_update_delta:
+                return
         self._last_load_update_time = now
+        self._last_emitted_load = current_load
         self._emit_event(
             "queue_update",
             load=self._load_metric(),
@@ -480,6 +485,12 @@ if __name__ == "__main__":
         default=0.0,
         help="Minimum interval between load-update emissions (ms)",
     )
+    parser.add_argument(
+        "--load-update-delta",
+        type=int,
+        default=0,
+        help="Minimum load change (tokens) to trigger an update",
+    )
     parser.add_argument("--log-level", type=str, default="INFO")
     args = parser.parse_args()
 
@@ -501,5 +512,6 @@ if __name__ == "__main__":
             base_ttft_ms=args.base_ttft_ms,
             per_token_ttft_ms=args.per_token_ttft_ms,
             load_update_interval_s=args.load_update_interval_ms / 1000.0,
+            load_update_delta=args.load_update_delta,
         ).run_forever()
     )

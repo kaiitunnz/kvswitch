@@ -14,7 +14,6 @@ Supports two modes:
 import argparse
 import asyncio
 import logging
-import socket
 from dataclasses import dataclass, field
 
 from kvswitch.utils.logger import setup_logging
@@ -24,21 +23,20 @@ logger = logging.getLogger(__name__)
 
 
 class ForwardProtocol(asyncio.DatagramProtocol):
-    """Fire-and-forget: forward raw datagrams to upstream, no reply."""
+    """Fire-and-forget: forward raw datagrams to upstream, no reply.
 
-    def __init__(self, upstream_host: str, upstream_port: int) -> None:
-        self._upstream_addr = (upstream_host, upstream_port)
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._sock.setblocking(False)
+    Uses a connected asyncio datagram transport so the kernel routes
+    packets correctly across network namespaces.
+    """
+
+    def __init__(self, upstream_transport: asyncio.DatagramTransport) -> None:
+        self._upstream = upstream_transport
 
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
-        try:
-            self._sock.sendto(data, self._upstream_addr)
-        except OSError:
-            pass
+        self._upstream.sendto(data)
 
     def connection_lost(self, exc: Exception | None) -> None:
-        self._sock.close()
+        self._upstream.close()
 
 
 @dataclass
@@ -78,8 +76,13 @@ class UDPRelay:
 async def _run(args: argparse.Namespace) -> None:
     if args.mode == "forward":
         loop = asyncio.get_running_loop()
+        # Create a connected upstream transport first (kernel-routed).
+        upstream_transport, _ = await loop.create_datagram_endpoint(
+            asyncio.DatagramProtocol,
+            remote_addr=(args.upstream_host, args.upstream_port),
+        )
         transport, _ = await loop.create_datagram_endpoint(
-            lambda: ForwardProtocol(args.upstream_host, args.upstream_port),
+            lambda: ForwardProtocol(upstream_transport),
             local_addr=(args.host, args.port),
         )
         logger.info(

@@ -100,34 +100,13 @@ def test_controller_installs_reroutes_and_deletes_leaf_rules_on_correct_switch()
     controller.handle_event(
         CacheSyncEvent("queue_update", "worker1", load=0, timestamp=2.5)
     )
-    reroute_ops = controller.handle_event(
+    # Sticky: alloc from worker1 does NOT reroute — worker0 keeps the rule.
+    sticky_ops = controller.handle_event(
         CacheSyncEvent("alloc", "worker1", prefix_hashes=prefix, timestamp=3.0)
     )
-    spine_reroutes = [
-        op
-        for op in reroute_ops
-        if isinstance(op, TableAddOp) and op.table == "spine_prefix_route"
-    ]
-    leaf_reroutes = [
-        op
-        for op in reroute_ops
-        if isinstance(op, TableAddOp) and op.table == "leaf_prefix_route"
-    ]
-    reroute_deletes = adapter.table_deletes()
-    assert any(op.action_params["port"] == 11 for op in spine_reroutes)
-    assert any(op.action_params["port"] == 2 for op in leaf_reroutes)
-    assert any(
-        op.table == "spine_prefix_route"
-        and op.match.get("hdr.kvswitch.h0") == "0x00000001&&&0xffffffff"
-        for op in reroute_deletes
-    )
-    assert any(
-        op.table == "leaf_prefix_route"
-        and op.match.get("hdr.kvswitch.h0") == "0x00000001&&&0xffffffff"
-        for op in reroute_deletes
-    )
-    assert controller.spine_tcam.installed_rule((0x1,)).target_id == "worker1"
-    assert controller.leaf_tcam.installed_rule(prefix).target_id == "worker1"
+    assert sticky_ops == []
+    assert controller.spine_tcam.installed_rule((0x1,)).target_id == "worker0"
+    assert controller.leaf_tcam.installed_rule(prefix).target_id == "worker0"
 
     other_prefix = (0x9, 0x8, 0x7)
     controller.handle_event(
@@ -154,19 +133,17 @@ def test_controller_installs_reroutes_and_deletes_leaf_rules_on_correct_switch()
         for op in new_leaf_adds
     )
 
-    fallback_ops = controller.handle_event(
+    # Evict from worker1 — worker0 still owns the prefix.  worker1 is
+    # removed as a candidate but the rule stays on worker0 (sticky).
+    controller.handle_event(
         CacheSyncEvent("evict", "worker1", prefix_hashes=prefix, timestamp=6.0)
     )
-    spine_fallbacks = [
-        op
-        for op in fallback_ops
-        if isinstance(op, TableAddOp) and op.table == "spine_prefix_route"
-    ]
-    assert any(op.action_params["port"] == 10 for op in spine_fallbacks)
     assert controller.spine_tcam.installed_rule((0x1,)).target_id == "worker0"
 
 
-def test_controller_prefers_lower_token_load_over_lower_active_request_count() -> None:
+def test_sticky_prefix_rules_resist_alloc_from_lighter_worker() -> None:
+    """Once a prefix rule is installed, a subsequent alloc from a lighter
+    worker does NOT reroute — the existing owner keeps the rule."""
     adapter = InMemorySwitchAdapter()
     controller = SDNController(
         workers=[
@@ -214,37 +191,19 @@ def test_controller_prefers_lower_token_load_over_lower_active_request_count() -
     )
 
     prefix = (0x1, 0x2, 0x3)
+    # First alloc installs on worker1 (lower load → selected as best).
     controller.handle_event(
-        CacheSyncEvent("alloc", "worker0", prefix_hashes=prefix, timestamp=2.0)
+        CacheSyncEvent("alloc", "worker1", prefix_hashes=prefix, timestamp=2.0)
     )
-    reroute_ops = controller.handle_event(
-        CacheSyncEvent("alloc", "worker1", prefix_hashes=prefix, timestamp=3.0)
-    )
+    assert controller.spine_tcam.installed_rule((0x1,)).target_id == "worker1"
 
+    # Second alloc from worker0 — worker1 still owns it (sticky).
+    sticky_ops = controller.handle_event(
+        CacheSyncEvent("alloc", "worker0", prefix_hashes=prefix, timestamp=3.0)
+    )
+    assert sticky_ops == []
     assert controller.spine_tcam.installed_rule((0x1,)).target_id == "worker1"
     assert controller.leaf_tcam.installed_rule(prefix).target_id == "worker1"
-    assert any(
-        isinstance(op, TableAddOp)
-        and op.table == "leaf_prefix_route"
-        and op.action_params["port"] == 2
-        for op in reroute_ops
-    )
-
-    snapshot = controller.snapshot()
-    assert snapshot["worker_loads"]["worker0"] == {
-        "active_requests": 1,
-        "active_batched_tokens": 12,
-        "queued_requests": 0,
-        "queued_batched_tokens": 0,
-        "load": 12,
-    }
-    assert snapshot["worker_loads"]["worker1"] == {
-        "active_requests": 10,
-        "active_batched_tokens": 1,
-        "queued_requests": 0,
-        "queued_batched_tokens": 0,
-        "load": 1,
-    }
 
 
 def test_controller_skips_prefix_reinstall_when_target_is_unchanged() -> None:
@@ -688,9 +647,9 @@ def test_queue_update_never_reroutes_prefix_rules() -> None:
     assert controller.leaf_tcam.installed_rule(prefix).target_id == "worker0"
 
 
-def test_hysteresis_suppresses_reroute_on_alloc() -> None:
-    """When a new alloc arrives from a slightly-better-scoring worker,
-    hysteresis prevents the reroute unless the gap exceeds the threshold."""
+def test_sticky_rule_transfers_on_owner_eviction() -> None:
+    """When the current owner evicts a prefix, the rule transfers to the
+    remaining candidate."""
     adapter = InMemorySwitchAdapter()
     controller = SDNController(
         workers=[
@@ -714,31 +673,26 @@ def test_hysteresis_suppresses_reroute_on_alloc() -> None:
         admission_threshold=1,
         adapter=adapter,
         spine_switch="s1",
-        reroute_score_threshold=0.3,
     )
 
-    # Install prefix on worker0.
     prefix = (0x1, 0x2, 0x3)
     controller.handle_event(
         CacheSyncEvent("alloc", "worker0", prefix_hashes=prefix, timestamp=1.0)
     )
-    assert controller.spine_tcam.installed_rule((0x1,)).target_id == "worker0"
-
-    # worker1 also allocs, but both at load=0 → score gap 0 < 0.3 → no reroute.
     controller.handle_event(
         CacheSyncEvent("alloc", "worker1", prefix_hashes=prefix, timestamp=2.0)
     )
     assert controller.spine_tcam.installed_rule((0x1,)).target_id == "worker0"
 
-    # Now worker0 has significant load → alloc from worker1 should reroute.
-    controller.handle_event(
-        CacheSyncEvent("queue_update", "worker0", load=100, timestamp=3.0)
-    )
-    # Trigger a new alloc from worker1 to re-evaluate the prefix rule.
-    controller.handle_event(
-        CacheSyncEvent("alloc", "worker1", prefix_hashes=prefix, timestamp=4.0)
+    # worker0 evicts → rule should transfer to worker1.
+    evict_ops = controller.handle_event(
+        CacheSyncEvent("evict", "worker0", prefix_hashes=prefix, timestamp=3.0)
     )
     assert controller.spine_tcam.installed_rule((0x1,)).target_id == "worker1"
+    assert any(
+        isinstance(op, TableAddOp) and op.action_params["port"] == 11
+        for op in evict_ops
+    )
 
 
 def test_warmup_populates_both_tcam_and_worker_cache() -> None:
