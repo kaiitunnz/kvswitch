@@ -33,6 +33,10 @@ control KVSwitchIngress(
         standard_metadata.egress_spec = port;
     }
 
+    action set_prefix_ecmp_group(bit<16> group_id) {
+        meta.prefix_ecmp_group = group_id;
+    }
+
     action compute_ecmp_bucket() {
         hash(
             meta.ecmp_bucket,
@@ -63,16 +67,32 @@ control KVSwitchIngress(
         default_action = NoAction();
     }
 
+    // Spine prefix match: maps h0 to a per-prefix ECMP group ID.
     table spine_prefix_route {
         key = {
             hdr.kvswitch.h0: ternary;
         }
         actions = {
-            route_to_pod;
+            set_prefix_ecmp_group;
             NoAction;
         }
         size = 1024;
         default_action = NoAction();
+    }
+
+    // Per-prefix ECMP: distributes prefix-matched traffic across leaves
+    // weighted by cache locality and load.
+    table spine_prefix_ecmp {
+        key = {
+            meta.prefix_ecmp_group: exact;
+            meta.ecmp_bucket: exact;
+        }
+        actions = {
+            route_to_pod;
+            drop;
+        }
+        size = 4096;
+        default_action = drop();
     }
 
     table leaf_prefix_route {
@@ -89,6 +109,7 @@ control KVSwitchIngress(
         default_action = NoAction();
     }
 
+    // Miss-path ECMP: distributes non-prefix-matched traffic.
     table spine_ecmp_select {
         key = {
             meta.ecmp_bucket: exact;
@@ -117,8 +138,13 @@ control KVSwitchIngress(
         if (hdr.kvswitch.isValid()) {
             // KVSwitch shim header present — use prefix-aware routing.
             if (!leaf_prefix_route.apply().hit) {
-                if (!spine_prefix_route.apply().hit) {
-                    compute_ecmp_bucket();
+                // Compute ECMP bucket for both prefix and miss paths.
+                compute_ecmp_bucket();
+                if (spine_prefix_route.apply().hit) {
+                    // Per-prefix weighted ECMP across cached leaves.
+                    spine_prefix_ecmp.apply();
+                } else {
+                    // Miss path: fall back to load-balanced ECMP.
                     if (!leaf_ecmp_select.apply().hit) {
                         spine_ecmp_select.apply();
                     }
