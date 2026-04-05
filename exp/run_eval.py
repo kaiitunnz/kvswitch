@@ -718,6 +718,33 @@ def _program_uniform_ecmp(
     )
 
 
+def _program_ingress_ecmp(
+    net: Mininet,
+    spine_names: list[str],
+    adapter: FinsyAdapter,
+) -> None:
+    """Program ingress-leaf ECMP to distribute across spines."""
+    ingress_switches = [sw for sw in net.switches if sw.name.startswith("ingress")]
+    for ing in ingress_switches:
+        ops: list[SwitchOp] = [
+            TableClearOp(switch=ing.name, table="spine_ecmp_select")
+        ]
+        for bucket in range(ECMP_BUCKETS):
+            sp_name = spine_names[bucket % len(spine_names)]
+            sp_port = _find_port(ing, _get_node(net, sp_name))
+            ops.append(
+                TableAddOp(
+                    switch=ing.name,
+                    table="spine_ecmp_select",
+                    action="route_to_pod",
+                    match={"meta.ecmp_bucket": bucket},
+                    action_params={"port": sp_port},
+                )
+            )
+        adapter.apply_ops(ops)
+    logger.info("Programmed ingress ECMP across %d spines", len(spine_names))
+
+
 def run_baseline_l4_rr(
     net: Mininet,
     topo: TopoConfig,
@@ -897,6 +924,7 @@ def run_baseline_kvswitch(
     base_ttft_ms: float | None = None,
     per_token_ttft_ms: float | None = None,
     admission_threshold: int = 2,
+    reroute_score_threshold: float = 50.0,
 ) -> list[RequestMetric]:
     """KVSwitch: SDN controller populates TCAM; switches route shim-header traffic."""
     logger.info("--- Baseline: KVSwitch ---")
@@ -912,6 +940,7 @@ def run_baseline_kvswitch(
             spine_switches=topo.spine_names,
             coalesce_interval_s=2.0,
             admission_threshold=admission_threshold,
+            reroute_score_threshold=reroute_score_threshold,
         )
         controller_runtime.run(controller.start())
         logger.info(
@@ -919,6 +948,11 @@ def run_baseline_kvswitch(
             controller_ip,
             CONTROLLER_PORT,
         )
+
+        # Program ingress leaf ECMP to distribute across spines.
+        # The controller manages spine and worker-leaf ECMP but not
+        # the ingress tier — that's static infrastructure.
+        _program_ingress_ecmp(net, topo.spine_names, adapter)
 
         client = _get_node(net, "client")
         _start_workers(
@@ -1057,6 +1091,7 @@ def main() -> None:
         help="Drop KVSwitch requests whose UDP payload exceeds this size in bytes",
     )
     parser.add_argument("--admission-threshold", type=int, default=2)
+    parser.add_argument("--reroute-threshold", type=float, default=50.0)
     parser.add_argument("--output-dir", type=str, default="results/eval")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log-level", type=str, default="INFO")
@@ -1256,6 +1291,7 @@ def main() -> None:
                     base_ttft_ms=base_ttft_ms,
                     per_token_ttft_ms=per_token_ttft_ms,
                     admission_threshold=args.admission_threshold,
+                    reroute_score_threshold=args.reroute_threshold,
                 )
             else:
                 continue

@@ -591,9 +591,9 @@ def test_worker_load_update_throttling() -> None:
     asyncio.run(_run())
 
 
-def test_queue_update_never_reroutes_prefix_rules() -> None:
-    """queue_update events should only affect ECMP weights, never reroute
-    installed prefix rules — the current target has the prefix cached."""
+def test_score_conditional_reroute_on_queue_update() -> None:
+    """queue_update reroutes prefix rules when a cached candidate has a
+    significantly better score, but holds steady for small deltas."""
     adapter = InMemorySwitchAdapter()
     controller = SDNController(
         workers=[
@@ -617,14 +617,10 @@ def test_queue_update_never_reroutes_prefix_rules() -> None:
         admission_threshold=1,
         adapter=adapter,
         spine_switches=["s1"],
+        reroute_score_threshold=50.0,
     )
 
-    # Make worker0 the clear winner so allocs install the rule on worker0.
-    controller.handle_event(
-        CacheSyncEvent("queue_update", "worker1", load=10, timestamp=0.5)
-    )
-
-    # Install a prefix rule on worker0 (higher score due to worker1's load).
+    # Install prefix rule on worker0; both workers have the prefix cached.
     prefix = (0x1, 0x2, 0x3)
     controller.handle_event(
         CacheSyncEvent("alloc", "worker0", prefix_hashes=prefix, timestamp=1.0)
@@ -633,18 +629,23 @@ def test_queue_update_never_reroutes_prefix_rules() -> None:
         CacheSyncEvent("alloc", "worker1", prefix_hashes=prefix, timestamp=2.0)
     )
     assert controller.spine_tcam.installed_rule((0x1,)).target_id == "worker0"
-    assert controller.leaf_tcam.installed_rule(prefix).target_id == "worker0"
 
-    # Massive load imbalance: worker0=1000, worker1=0.
-    # Prefix rule must NOT move — worker0 has the cache.
+    # Small load delta (20 < threshold 50): rule stays on worker0.
     controller.handle_event(
-        CacheSyncEvent("queue_update", "worker0", load=1000, timestamp=3.0)
+        CacheSyncEvent("queue_update", "worker0", load=20, timestamp=3.0)
     )
     controller.handle_event(
         CacheSyncEvent("queue_update", "worker1", load=0, timestamp=3.0)
     )
     assert controller.spine_tcam.installed_rule((0x1,)).target_id == "worker0"
     assert controller.leaf_tcam.installed_rule(prefix).target_id == "worker0"
+
+    # Large load delta (1000 >> threshold 50): reroutes to worker1.
+    controller.handle_event(
+        CacheSyncEvent("queue_update", "worker0", load=1000, timestamp=4.0)
+    )
+    assert controller.spine_tcam.installed_rule((0x1,)).target_id == "worker1"
+    assert controller.leaf_tcam.installed_rule(prefix).target_id == "worker1"
 
 
 def test_sticky_rule_transfers_on_owner_eviction() -> None:

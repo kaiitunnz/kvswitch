@@ -183,6 +183,7 @@ class SDNController:
         adapter: SwitchAdapter | None = None,
         spine_switches: list[str] | None = None,
         coalesce_interval_s: float = 0.0,
+        reroute_score_threshold: float = 50.0,
     ) -> None:
         self._workers = {worker.worker_id: worker for worker in workers}
         self._server = UDPServer(host=host, port=port, handler=self._handle)
@@ -190,6 +191,7 @@ class SDNController:
         self._spine_switches = spine_switches or []
         self.alpha = alpha
         self.beta = beta
+        self._reroute_score_threshold = reroute_score_threshold
 
         self.spine_tcam = TcamManager(
             admission_threshold=admission_threshold,
@@ -304,15 +306,13 @@ class SDNController:
                 event.active_requests or 0,
                 event.queued_requests or 0,
             )
-            # Queue updates only affect ECMP weights for miss traffic.
-            # Installed prefix rules are NOT re-evaluated here: the current
-            # target already has the prefix cached, so rerouting based on
-            # transient load would send requests to a cold worker.
+            # Queue updates affect both ECMP weights (miss traffic) and
+            # prefix rule targets (score-conditional rerouting among cached
+            # candidates).  Coalescing collapses rapid updates into one cycle.
             if self._coalesce_interval_s <= 0:
+                ops.extend(self._reconcile_all_rules(now))
                 ops.extend(self._refresh_ecmp_weights())
             else:
-                # Coalesce: schedule a deferred reconciliation so rapid
-                # queue_updates collapse into a single refresh cycle.
                 self._schedule_coalesced_refresh()
             return ops
 
@@ -445,17 +445,21 @@ class SDNController:
             return []
         existing = self.spine_tcam.installed_rule(prefix)
 
-        # Sticky prefix rules: once installed, keep the current owner.
-        # The owner already has the prefix cached; rerouting on alloc would
-        # send future requests to a potentially colder worker.  The rule
-        # only changes on eviction or when the owner is no longer a candidate.
-        if existing is not None:
-            if existing.target_id in candidates:
+        # Sticky with score-conditional escape: keep the current owner unless
+        # a cached candidate has a significantly better score.  This balances
+        # cache locality (don't migrate unnecessarily) with load balance
+        # (don't let one worker accumulate all prefix traffic).
+        if existing is not None and existing.target_id in candidates:
+            best = self._select_worker(candidates)
+            score_gap = (
+                self._worker_score(best) - self._worker_score(existing.target_id)
+            )
+            if best == existing.target_id or score_gap <= self._reroute_score_threshold:
                 self.spine_tcam.install(
                     prefix, existing.target_id, hit_count=hit_count, now=now
                 )
                 return []
-            # Current owner evicted the prefix — pick a new one.
+            # Fall through: best is sufficiently better — reroute.
 
         worker_id = self._select_worker(candidates)
         _, evicted = self.spine_tcam.install(
@@ -504,9 +508,13 @@ class SDNController:
             return []
         existing = self.leaf_tcam.installed_rule(prefix)
 
-        # Sticky: keep current owner if still a candidate.
-        if existing is not None:
-            if existing.target_id in candidates:
+        # Score-conditional stickiness (same logic as spine rules).
+        if existing is not None and existing.target_id in candidates:
+            best = self._select_worker(candidates)
+            score_gap = (
+                self._worker_score(best) - self._worker_score(existing.target_id)
+            )
+            if best == existing.target_id or score_gap <= self._reroute_score_threshold:
                 self.leaf_tcam.install(
                     prefix, existing.target_id, hit_count=hit_count, now=now
                 )
@@ -631,10 +639,12 @@ class SDNController:
         self._flush_coalesced_refresh()
 
     def _flush_coalesced_refresh(self) -> None:
-        """Refresh ECMP weights if dirty. Prefix rules are not touched here."""
+        """Reconcile prefix rules and refresh ECMP weights if dirty."""
         if not self._coalesce_dirty:
             return
         self._coalesce_dirty = False
+        now = time.time()
+        self._reconcile_all_rules(now)
         self._refresh_ecmp_weights()
 
     def _reconcile_all_rules(self, now: float) -> list[SwitchOp]:
