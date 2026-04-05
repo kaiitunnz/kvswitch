@@ -642,6 +642,10 @@ def _program_uniform_ecmp(
 ) -> None:
     """Program uniform ECMP tables on all spines and leaves for L4 round-robin."""
 
+    # Clear per-prefix ECMP tables (may have stale entries from a previous run).
+    for sp_name in spine_names:
+        adapter.apply_ops([TableClearOp(switch=sp_name, table="spine_prefix_ecmp")])
+
     # --- Spine ECMP: distribute buckets across worker leaves ---
     leaf_names = sorted({p.leaf_switch for p in placements})
     for sp_name in spine_names:
@@ -994,7 +998,7 @@ def run_baseline_kvswitch(
             logger.info(
                 "Warm-up complete. Controller snapshot: spine_rules=%d leaf_rules=%d",
                 len(controller.spine_tcam.snapshot()),
-                len(controller.leaf_tcam.snapshot()),
+                sum(len(t.snapshot()) for t in controller.leaf_tcams.values()),
             )
 
         try:
