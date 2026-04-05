@@ -3,7 +3,11 @@
 import asyncio
 from pathlib import Path
 
-from kvswitch.controller.finsy_adapter import FinsyAdapter, _TableClearSentinel
+from kvswitch.controller.finsy_adapter import (
+    FinsyAdapter,
+    _normalize_match,
+    _TableClearSentinel,
+)
 from kvswitch.controller.switch_adapter import TableAddOp, TableClearOp, TableDeleteOp
 
 
@@ -16,6 +20,11 @@ def _make_adapter() -> FinsyAdapter:
 
 
 class TestToFinsy:
+    def test_normalize_match_converts_bmv2_ternary_to_finsy_format(self) -> None:
+        assert _normalize_match({"hdr.kvswitch.h0": "0xABCD1234&&&0xffffffff"}) == {
+            "hdr.kvswitch.h0": "0xABCD1234/&0xffffffff"
+        }
+
     def test_table_add_ternary(self) -> None:
         adapter = _make_adapter()
         op = TableAddOp(
@@ -28,6 +37,7 @@ class TestToFinsy:
         )
         entity = adapter._to_finsy(op)
         assert entity is not None
+        assert entity.match["hdr.kvswitch.h0"] == "0xABCD1234/&0xffffffff"
 
     def test_table_add_leaf(self) -> None:
         adapter = _make_adapter()
@@ -45,6 +55,11 @@ class TestToFinsy:
         )
         entity = adapter._to_finsy(op)
         assert entity is not None
+        assert entity.match == {
+            "hdr.kvswitch.h0": "0x00000001/&0xffffffff",
+            "hdr.kvswitch.h1": "0x00000002/&0xffffffff",
+            "hdr.kvswitch.h2": "0x00000003/&0xffffffff",
+        }
 
     def test_table_add_ecmp(self) -> None:
         adapter = _make_adapter()
@@ -122,6 +137,37 @@ class TestWrite:
         assert len(fake.calls[0][1]) == 1
         assert fake.calls[0][1][0].table_id == "leaf_ecmp_select"
         assert len(fake.calls[1][1]) == 1
+
+    def test_write_serialized_per_switch(self) -> None:
+        adapter = _make_adapter()
+        first = ["first"]
+        second = ["second"]
+
+        class FakeSwitch:
+            name = "s2"
+
+            def __init__(self) -> None:
+                self.events: list[str] = []
+
+            async def delete_many(self, entities) -> None:
+                raise AssertionError("delete_many should not be called")
+
+            async def write(self, updates) -> None:
+                label = list(updates)[0]
+                self.events.append(f"start-{label}")
+                await asyncio.sleep(0.01)
+                self.events.append(f"end-{label}")
+
+        async def _run() -> list[str]:
+            fake = FakeSwitch()
+            await asyncio.gather(
+                adapter._write_serialized(fake, first),
+                adapter._write_serialized(fake, second),
+            )
+            return fake.events
+
+        events = asyncio.run(_run())  # type: ignore[arg-type]
+        assert events == ["start-first", "end-first", "start-second", "end-second"]
 
 
 class TestApplyOps:

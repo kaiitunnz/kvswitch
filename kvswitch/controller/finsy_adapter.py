@@ -25,6 +25,24 @@ from kvswitch.controller.switch_adapter import (
 logger = logging.getLogger(__name__)
 
 
+def _normalize_match(match: dict[str, str | int]) -> dict[str, str | int]:
+    """Translate controller match values into the format expected by Finsy.
+
+    The controller still emits BMv2-style ternary strings (``0xVAL&&&0xMASK``)
+    because the in-memory adapter and earlier BMv2 CLI path used that form.
+    Finsy expects ternary masks in ``value/&mask`` form instead, so normalize
+    them here at the P4Runtime boundary.
+    """
+    normalized: dict[str, str | int] = {}
+    for field_name, value in match.items():
+        if isinstance(value, str) and "&&&" in value:
+            ternary_value, ternary_mask = value.split("&&&", maxsplit=1)
+            normalized[field_name] = f"{ternary_value}/&{ternary_mask}"
+        else:
+            normalized[field_name] = value
+    return normalized
+
+
 @dataclass
 class FinsyAdapter:
     """Applies structured table operations to BMv2 switches via Finsy P4Runtime.
@@ -55,6 +73,12 @@ class FinsyAdapter:
     )
     _ready: dict[str, asyncio.Event] = field(
         default_factory=dict, init=False, repr=False
+    )
+    _write_tails: dict[str, asyncio.Task[None]] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    _background_tasks: set[asyncio.Task[None]] = field(
+        default_factory=set, init=False, repr=False
     )
 
     async def start(self) -> None:
@@ -97,6 +121,9 @@ class FinsyAdapter:
 
     def close(self) -> None:
         """Disconnect from all switches."""
+        for task in list(self._background_tasks):
+            task.cancel()
+        self._background_tasks.clear()
         if self._controller is not None:
             self._controller.stop()
 
@@ -126,12 +153,39 @@ class FinsyAdapter:
                 running_loop = None
 
             if running_loop is self._loop:
-                asyncio.create_task(self._write(sw, entities))
+                task = asyncio.create_task(self._write_serialized(sw, entities))
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
             else:
                 future = asyncio.run_coroutine_threadsafe(
-                    self._write(sw, entities), self._loop
+                    self._write_serialized(sw, entities), self._loop
                 )
                 future.result(timeout=5.0)
+
+    async def _write_serialized(self, sw: finsy.Switch, entities: list[Any]) -> None:
+        current_task = asyncio.current_task()
+        if current_task is None:
+            await self._write(sw, entities)
+            return
+
+        previous_task = self._write_tails.get(sw.name)
+        self._write_tails[sw.name] = current_task
+
+        if previous_task is not None and previous_task is not current_task:
+            try:
+                await asyncio.shield(previous_task)
+            except Exception:
+                logger.debug(
+                    "Previous write task for %s failed before queued update applied",
+                    sw.name,
+                    exc_info=True,
+                )
+
+        try:
+            await self._write(sw, entities)
+        finally:
+            if self._write_tails.get(sw.name) is current_task:
+                self._write_tails.pop(sw.name, None)
 
     async def _write(self, sw: finsy.Switch, entities: list[Any]) -> None:
         try:
@@ -158,14 +212,14 @@ class FinsyAdapter:
             case TableAddOp():
                 return +finsy.P4TableEntry(
                     table_id=op.table,
-                    match=finsy.P4TableMatch(op.match),
+                    match=finsy.P4TableMatch(_normalize_match(op.match)),
                     action=finsy.P4TableAction(op.action, **op.action_params),
                     priority=op.priority,
                 )
             case TableDeleteOp():
                 return -finsy.P4TableEntry(
                     table_id=op.table,
-                    match=finsy.P4TableMatch(op.match),
+                    match=finsy.P4TableMatch(_normalize_match(op.match)),
                     priority=op.priority,
                 )
             case _:
