@@ -69,7 +69,7 @@ PYTHON = sys.executable
 WORKER_PORT = 8000
 ROUTER_PORT = 9000
 CONTROLLER_PORT = 9100
-WARMUP_PER_GROUP = 20
+DEFAULT_WARMUP_PER_GROUP = 20
 
 HEALTHCHECK_MODULE = "kvswitch.network.cli.healthcheck"
 WORKLOAD_CLIENT_MODULE = "kvswitch.network.cli.workload_client"
@@ -767,6 +767,7 @@ def run_baseline_l4_rr(
     per_token_ttft_ms: float | None = None,
     max_num_seqs: int = 256,
     max_num_batched_tokens: int = 8192,
+    warmup_per_group: int = DEFAULT_WARMUP_PER_GROUP,
 ) -> list[RequestMetric]:
     """L4 Round-Robin: uniform ECMP distributes traffic via KVSwitch VIP."""
     logger.info("--- Baseline: L4 Round-Robin ---")
@@ -792,7 +793,7 @@ def run_baseline_l4_rr(
 
     # Warm up worker caches so the timed run reflects steady-state.
     warmup_workload = _build_warmup_workload(
-        workload_path, n_per_group=WARMUP_PER_GROUP
+        workload_path, n_per_group=warmup_per_group
     )
     if warmup_workload:
         warmup_path = "/tmp/eval_warmup.json"
@@ -834,6 +835,7 @@ def run_baseline_l7(
     per_token_ttft_ms: float | None = None,
     max_num_seqs: int = 256,
     max_num_batched_tokens: int = 8192,
+    warmup_per_group: int = DEFAULT_WARMUP_PER_GROUP,
 ) -> list[RequestMetric]:
     """L7 Prefix-Aware: Client → L7 proxy → best worker."""
     logger.info("--- Baseline: L7 Prefix-Aware Router ---")
@@ -875,7 +877,7 @@ def run_baseline_l7(
 
     # Warm up worker caches and router prefix table.
     warmup_workload = _build_warmup_workload(
-        workload_path, n_per_group=WARMUP_PER_GROUP
+        workload_path, n_per_group=warmup_per_group
     )
     if warmup_workload:
         warmup_path = "/tmp/eval_warmup.json"
@@ -948,6 +950,8 @@ def run_baseline_kvswitch(
     admission_threshold: int = 2,
     max_num_seqs: int = 256,
     max_num_batched_tokens: int = 8192,
+    per_prefix_ecmp: bool = True,
+    warmup_per_group: int = DEFAULT_WARMUP_PER_GROUP,
 ) -> list[RequestMetric]:
     """KVSwitch: SDN controller populates TCAM; switches route shim-header traffic."""
     logger.info("--- Baseline: KVSwitch ---")
@@ -963,6 +967,7 @@ def run_baseline_kvswitch(
             spine_switches=topo.spine_names,
             coalesce_interval_s=2.0,
             admission_threshold=admission_threshold,
+            per_prefix_ecmp=per_prefix_ecmp,
         )
         controller_runtime.run(controller.start())
         logger.info(
@@ -996,7 +1001,7 @@ def run_baseline_kvswitch(
         # Warm-up: send requests to populate both TCAM prefix rules and worker
         # caches.  Workers stay running so switch and cache state are consistent.
         warmup_workload = _build_warmup_workload(
-            workload_path, n_per_group=WARMUP_PER_GROUP
+            workload_path, n_per_group=warmup_per_group
         )
         if warmup_workload:
             warmup_path = "/tmp/eval_warmup.json"
@@ -1117,6 +1122,18 @@ def main() -> None:
     parser.add_argument("--admission-threshold", type=int, default=2)
     parser.add_argument("--max-num-seqs", type=int, default=256)
     parser.add_argument("--max-num-batched-tokens", type=int, default=8192)
+    parser.add_argument(
+        "--per-prefix-ecmp",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable per-prefix ECMP (default: enabled, --no-per-prefix-ecmp to disable)",
+    )
+    parser.add_argument(
+        "--warmup-per-group",
+        type=int,
+        default=DEFAULT_WARMUP_PER_GROUP,
+        help="Warm-up requests per prefix group (0 to disable)",
+    )
     parser.add_argument("--output-dir", type=str, default="results/eval")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log-level", type=str, default="INFO")
@@ -1290,6 +1307,7 @@ def main() -> None:
                     per_token_ttft_ms=per_token_ttft_ms,
                     max_num_seqs=args.max_num_seqs,
                     max_num_batched_tokens=args.max_num_batched_tokens,
+                    warmup_per_group=args.warmup_per_group,
                 )
             elif baseline == "l7":
                 metrics = run_baseline_l7(
@@ -1305,6 +1323,7 @@ def main() -> None:
                     per_token_ttft_ms=per_token_ttft_ms,
                     max_num_seqs=args.max_num_seqs,
                     max_num_batched_tokens=args.max_num_batched_tokens,
+                    warmup_per_group=args.warmup_per_group,
                 )
             elif baseline == "kvswitch":
                 metrics = run_baseline_kvswitch(
@@ -1322,6 +1341,8 @@ def main() -> None:
                     admission_threshold=args.admission_threshold,
                     max_num_seqs=args.max_num_seqs,
                     max_num_batched_tokens=args.max_num_batched_tokens,
+                    per_prefix_ecmp=args.per_prefix_ecmp,
+                    warmup_per_group=args.warmup_per_group,
                 )
             else:
                 continue

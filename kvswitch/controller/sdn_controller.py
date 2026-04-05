@@ -183,6 +183,7 @@ class SDNController:
         adapter: SwitchAdapter | None = None,
         spine_switches: list[str] | None = None,
         coalesce_interval_s: float = 0.0,
+        per_prefix_ecmp: bool = True,
     ) -> None:
         self._workers = {worker.worker_id: worker for worker in workers}
         self._server = UDPServer(host=host, port=port, handler=self._handle)
@@ -190,6 +191,7 @@ class SDNController:
         self._spine_switches = spine_switches or []
         self.alpha = alpha
         self.beta = beta
+        self._per_prefix_ecmp = per_prefix_ecmp
 
         self.spine_tcam = TcamManager(
             admission_threshold=admission_threshold,
@@ -408,21 +410,26 @@ class SDNController:
         if not leaves_with_prefix:
             return []
 
-        per_leaf_weights: dict[str, float] = {
-            leaf: sum(self._inverse_queue_weight(w) for w in ws)
-            for leaf, ws in leaves_with_prefix.items()
-        }
-
-        # Probe-fraction seeding: allocate a small weight to uncovered leaves
-        # so ~1 ECMP bucket sends traffic there.  This seeds cross-leaf
-        # replication deterministically — the probe worker caches the prefix,
-        # emits alloc, and the next reconciliation replaces the probe weight
-        # with real load-based weight.
-        uncovered = set(self.leaf_tcams) - set(leaves_with_prefix)
-        for leaf in uncovered:
-            per_leaf_weights[leaf] = 0.05
-
-        bucket_map = self._allocate_buckets(per_leaf_weights)
+        if self._per_prefix_ecmp:
+            per_leaf_weights: dict[str, float] = {
+                leaf: sum(self._inverse_queue_weight(w) for w in ws)
+                for leaf, ws in leaves_with_prefix.items()
+            }
+            # Probe-fraction seeding: allocate a small weight to uncovered
+            # leaves so ~1 ECMP bucket sends traffic there for replication.
+            uncovered = set(self.leaf_tcams) - set(leaves_with_prefix)
+            for leaf in uncovered:
+                per_leaf_weights[leaf] = 0.05
+            bucket_map = self._allocate_buckets(per_leaf_weights)
+        else:
+            # Pin prefix to the single best leaf.
+            best_leaf = max(
+                leaves_with_prefix,
+                key=lambda lf: sum(
+                    self._worker_score(w) for w in leaves_with_prefix[lf]
+                ),
+            )
+            bucket_map = self._allocate_buckets({best_leaf: 1.0})
 
         # Assign or reuse ECMP group ID.
         if prefix not in self._prefix_group_ids:
@@ -580,20 +587,24 @@ class SDNController:
             if not tcam.admitted(prefix, now):
                 continue
 
-            # Compute per-worker weights for this leaf.
-            per_worker_weights: dict[str, float] = {
-                w: self._inverse_queue_weight(w) for w in local_candidates
-            }
-
-            # Probe-fraction seeding: uncovered local workers get probe weight.
-            all_local_workers = {
-                w_id
-                for w_id, w in self._workers.items()
-                if w.leaf_switch == leaf_switch
-            }
-            uncovered = all_local_workers - local_candidates
-            for w in uncovered:
-                per_worker_weights[w] = 0.05
+            if self._per_prefix_ecmp:
+                # Compute per-worker weights for this leaf.
+                per_worker_weights: dict[str, float] = {
+                    w: self._inverse_queue_weight(w) for w in local_candidates
+                }
+                # Probe-fraction seeding: uncovered local workers get probe weight.
+                all_local_workers = {
+                    w_id
+                    for w_id, w in self._workers.items()
+                    if w.leaf_switch == leaf_switch
+                }
+                uncovered = all_local_workers - local_candidates
+                for w in uncovered:
+                    per_worker_weights[w] = 0.05
+            else:
+                # Pin prefix to the single best local worker.
+                best_worker = self._select_worker(local_candidates)
+                per_worker_weights = {best_worker: 1.0}
 
             bucket_map = self._allocate_buckets(per_worker_weights)
 
