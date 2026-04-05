@@ -173,6 +173,8 @@ class SDNController:
         beta: float = 1.0,
         adapter: SwitchAdapter | None = None,
         spine_switch: str = "s1",
+        coalesce_interval_s: float = 0.0,
+        reroute_score_threshold: float = 0.0,
     ) -> None:
         self._workers = {worker.worker_id: worker for worker in workers}
         self._server = UDPServer(host=host, port=port, handler=self._handle)
@@ -180,6 +182,7 @@ class SDNController:
         self._spine_switch = spine_switch
         self.alpha = alpha
         self.beta = beta
+        self._reroute_score_threshold = reroute_score_threshold
 
         self.spine_tcam = TcamManager(
             admission_threshold=admission_threshold,
@@ -198,6 +201,14 @@ class SDNController:
         }
         self._spine_locations: dict[tuple[int, ...], set[str]] = defaultdict(set)
         self._leaf_locations: dict[PrefixKey, set[str]] = defaultdict(set)
+        self._spine_ecmp_bucket_map: dict[int, str] = {}
+        self._leaf_ecmp_bucket_maps: dict[str, dict[int, str]] = defaultdict(dict)
+
+        # Coalescing: instead of reconciling on every queue_update, we schedule
+        # a single deferred refresh that absorbs all updates within the interval.
+        self._coalesce_interval_s = coalesce_interval_s
+        self._coalesce_task: asyncio.Task[None] | None = None
+        self._coalesce_dirty: bool = False
 
     @property
     def port(self) -> int:
@@ -209,6 +220,9 @@ class SDNController:
         logger.info("SDN controller listening on %s:%d", self._server.host, self.port)
 
     def close(self) -> None:
+        if self._coalesce_task is not None:
+            self._coalesce_task.cancel()
+            self._coalesce_task = None
         self._server.close()
 
     def snapshot(self) -> dict[str, Any]:
@@ -276,18 +290,23 @@ class SDNController:
                 queued_batched_tokens=event.queued_batched_tokens or 0,
                 load=event.load,
             )
-            # Load updates can change both installed rule targets and ECMP weights.
-            logger.info(
-                "Updated worker load for %s to load=%d active_requests=%d queued_requests=%d active_batched_tokens=%d queued_batched_tokens=%d",
+            logger.debug(
+                "Updated worker load for %s: load=%d active_req=%d queued_req=%d",
                 event.worker_id,
                 event.load,
                 event.active_requests or 0,
                 event.queued_requests or 0,
-                event.active_batched_tokens or 0,
-                event.queued_batched_tokens or 0,
             )
-            ops.extend(self._reconcile_all_rules(now))
-            ops.extend(self._refresh_ecmp_weights())
+            # Queue updates only affect ECMP weights for miss traffic.
+            # Installed prefix rules are NOT re-evaluated here: the current
+            # target already has the prefix cached, so rerouting based on
+            # transient load would send requests to a cold worker.
+            if self._coalesce_interval_s <= 0:
+                ops.extend(self._refresh_ecmp_weights())
+            else:
+                # Coalesce: schedule a deferred reconciliation so rapid
+                # queue_updates collapse into a single refresh cycle.
+                self._schedule_coalesced_refresh()
             return ops
 
         if not event.prefix_hashes:
@@ -414,10 +433,33 @@ class SDNController:
         if not candidates:
             return []
         worker_id = self._select_worker(candidates)
+        existing = self.spine_tcam.installed_rule(prefix)
+        if existing is not None and existing.target_id == worker_id:
+            self.spine_tcam.install(prefix, worker_id, hit_count=hit_count, now=now)
+            return []
+
+        # Hysteresis: only reroute when the new worker is significantly better
+        # than the current one.  Prevents flip-flopping on small load deltas.
+        if existing is not None and existing.target_id in candidates:
+            current_score = self._worker_score(existing.target_id)
+            new_score = self._worker_score(worker_id)
+            if new_score - current_score < self._reroute_score_threshold:
+                return []
+
+        previous_worker_id = existing.target_id if existing is not None else None
         _, evicted = self.spine_tcam.install(
             prefix, worker_id, hit_count=hit_count, now=now
         )
         ops: list[SwitchOp] = []
+        if previous_worker_id is not None:
+            ops.append(self._spine_delete_op(prefix))
+            logger.info(
+                "Rerouting spine prefix rule prefix=%s old_worker=%s new_worker=%s switch=%s",
+                format_prefix_key(prefix),
+                previous_worker_id,
+                worker_id,
+                self._spine_switch,
+            )
         if evicted is not None:
             ops.append(self._spine_delete_op(evicted[0]))
             logger.info(
@@ -449,11 +491,37 @@ class SDNController:
         if not candidates:
             return []
         worker_id = self._select_worker(candidates)
-        rule, evicted = self.leaf_tcam.install(
+        existing = self.leaf_tcam.installed_rule(prefix)
+        if existing is not None and existing.target_id == worker_id:
+            self.leaf_tcam.install(prefix, worker_id, hit_count=hit_count, now=now)
+            return []
+
+        # Hysteresis: only reroute when the new worker is significantly better.
+        if existing is not None and existing.target_id in candidates:
+            current_score = self._worker_score(existing.target_id)
+            new_score = self._worker_score(worker_id)
+            if new_score - current_score < self._reroute_score_threshold:
+                return []
+
+        previous_worker_id = existing.target_id if existing is not None else None
+        _, evicted = self.leaf_tcam.install(
             prefix, worker_id, hit_count=hit_count, now=now
         )
         switch_name, add_op = self._leaf_add_op(prefix, worker_id)
         ops: list[SwitchOp] = []
+        if previous_worker_id is not None:
+            previous_switch, delete_op = self._leaf_delete_op(
+                prefix, previous_worker_id
+            )
+            ops.append(delete_op)
+            logger.info(
+                "Rerouting leaf prefix rule prefix=%s old_worker=%s new_worker=%s old_switch=%s new_switch=%s",
+                format_prefix_key(prefix),
+                previous_worker_id,
+                worker_id,
+                previous_switch,
+                switch_name,
+            )
         if evicted is not None:
             evicted_switch, evict_op = self._leaf_delete_op(
                 evicted[0], evicted[1].target_id
@@ -473,7 +541,7 @@ class SDNController:
             worker_id,
             switch_name,
         )
-        self._adapter.apply_ops([add_op])
+        self._adapter.apply_ops(ops)
         return ops
 
     def _apply_spine_eviction(
@@ -527,6 +595,34 @@ class SDNController:
         )
         self._adapter.apply_ops([op])
         return [op]
+
+    def _schedule_coalesced_refresh(self) -> None:
+        """Mark state dirty and schedule a single deferred reconciliation.
+
+        If a task is already pending, let it absorb this update — no new task needed.
+        When ``coalesce_interval_s`` is 0 (e.g. in tests), refresh immediately.
+        """
+        self._coalesce_dirty = True
+        if self._coalesce_interval_s <= 0:
+            self._flush_coalesced_refresh()
+            return
+        if self._coalesce_task is None or self._coalesce_task.done():
+            self._coalesce_task = asyncio.create_task(self._coalesced_refresh())
+
+    async def _coalesced_refresh(self) -> None:
+        """Wait for the coalesce interval, then apply a single reconciliation."""
+        try:
+            await asyncio.sleep(self._coalesce_interval_s)
+        except asyncio.CancelledError:
+            return
+        self._flush_coalesced_refresh()
+
+    def _flush_coalesced_refresh(self) -> None:
+        """Refresh ECMP weights if dirty. Prefix rules are not touched here."""
+        if not self._coalesce_dirty:
+            return
+        self._coalesce_dirty = False
+        self._refresh_ecmp_weights()
 
     def _reconcile_all_rules(self, now: float) -> list[SwitchOp]:
         ops: list[SwitchOp] = []
@@ -594,6 +690,8 @@ class SDNController:
         for worker_id, placement in self._workers.items():
             per_leaf[placement.leaf_switch] += self._inverse_queue_weight(worker_id)
         bucket_map = self._allocate_buckets(per_leaf)
+        if bucket_map == self._spine_ecmp_bucket_map:
+            return []
         leaves = {
             placement.leaf_switch: placement.spine_port
             for placement in self._workers.values()
@@ -612,6 +710,7 @@ class SDNController:
                 )
             )
         self._adapter.apply_ops(ops)
+        self._spine_ecmp_bucket_map = dict(bucket_map)
         return ops
 
     def _program_leaf_ecmp(self) -> list[SwitchOp]:
@@ -625,6 +724,8 @@ class SDNController:
 
         for leaf_switch, weights in workers_by_leaf.items():
             bucket_map = self._allocate_buckets(weights)
+            if bucket_map == self._leaf_ecmp_bucket_maps.get(leaf_switch):
+                continue
             ops: list[SwitchOp] = [
                 TableClearOp(switch=leaf_switch, table="leaf_ecmp_select")
             ]
@@ -643,6 +744,7 @@ class SDNController:
                     )
                 )
             self._adapter.apply_ops(ops)
+            self._leaf_ecmp_bucket_maps[leaf_switch] = dict(bucket_map)
             all_ops.extend(ops)
         return all_ops
 

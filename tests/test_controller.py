@@ -113,8 +113,19 @@ def test_controller_installs_reroutes_and_deletes_leaf_rules_on_correct_switch()
         for op in reroute_ops
         if isinstance(op, TableAddOp) and op.table == "leaf_prefix_route"
     ]
+    reroute_deletes = adapter.table_deletes()
     assert any(op.action_params["port"] == 11 for op in spine_reroutes)
     assert any(op.action_params["port"] == 2 for op in leaf_reroutes)
+    assert any(
+        op.table == "spine_prefix_route"
+        and op.match.get("hdr.kvswitch.h0") == "0x00000001&&&0xffffffff"
+        for op in reroute_deletes
+    )
+    assert any(
+        op.table == "leaf_prefix_route"
+        and op.match.get("hdr.kvswitch.h0") == "0x00000001&&&0xffffffff"
+        for op in reroute_deletes
+    )
     assert controller.spine_tcam.installed_rule((0x1,)).target_id == "worker1"
     assert controller.leaf_tcam.installed_rule(prefix).target_id == "worker1"
 
@@ -234,6 +245,98 @@ def test_controller_prefers_lower_token_load_over_lower_active_request_count() -
         "queued_batched_tokens": 0,
         "load": 1,
     }
+
+
+def test_controller_skips_prefix_reinstall_when_target_is_unchanged() -> None:
+    adapter = InMemorySwitchAdapter()
+    controller = SDNController(
+        workers=[
+            WorkerPlacement(
+                worker_id="worker0",
+                leaf_switch="leaf0",
+                worker_ip="10.0.0.1",
+                worker_mac="02:00:00:00:00:01",
+                spine_port=10,
+                leaf_port=1,
+            ),
+            WorkerPlacement(
+                worker_id="worker1",
+                leaf_switch="leaf1",
+                worker_ip="10.0.1.1",
+                worker_mac="02:00:00:00:00:02",
+                spine_port=11,
+                leaf_port=2,
+            ),
+        ],
+        admission_threshold=1,
+        adapter=adapter,
+        spine_switch="s1",
+    )
+
+    controller.handle_event(
+        CacheSyncEvent("queue_update", "worker0", load=0, timestamp=0.5)
+    )
+    controller.handle_event(
+        CacheSyncEvent("queue_update", "worker1", load=0, timestamp=0.5)
+    )
+
+    prefix = (0x53, 0x9D, 0x89)
+    install_ops = controller.handle_event(
+        CacheSyncEvent("alloc", "worker1", prefix_hashes=prefix, timestamp=1.0)
+    )
+    assert install_ops
+    op_count = len(adapter.ops)
+
+    stable_ops = controller.handle_event(
+        CacheSyncEvent("queue_update", "worker1", load=0, timestamp=2.0)
+    )
+    assert stable_ops == []
+    assert len(adapter.ops) == op_count
+
+
+def test_controller_skips_noop_ecmp_refresh() -> None:
+    adapter = InMemorySwitchAdapter()
+    controller = SDNController(
+        workers=[
+            WorkerPlacement(
+                worker_id="worker0",
+                leaf_switch="leaf0",
+                worker_ip="10.0.0.1",
+                worker_mac="02:00:00:00:00:01",
+                spine_port=10,
+                leaf_port=1,
+            ),
+            WorkerPlacement(
+                worker_id="worker1",
+                leaf_switch="leaf1",
+                worker_ip="10.0.1.1",
+                worker_mac="02:00:00:00:00:02",
+                spine_port=11,
+                leaf_port=2,
+            ),
+        ],
+        adapter=adapter,
+        spine_switch="s1",
+    )
+
+    first_ops = controller._refresh_ecmp_weights()
+    assert first_ops
+    first_op_count = len(adapter.ops)
+
+    second_ops = controller._refresh_ecmp_weights()
+    assert second_ops == []
+    assert len(adapter.ops) == first_op_count
+
+    changed_ops = controller.handle_event(
+        CacheSyncEvent("queue_update", "worker0", load=8, timestamp=1.0)
+    )
+    assert changed_ops
+    assert len(adapter.ops) > first_op_count
+
+    stable_again = controller.handle_event(
+        CacheSyncEvent("queue_update", "worker0", load=8, timestamp=2.0)
+    )
+    assert stable_again == []
 
 
 async def _wait_until(predicate, timeout: float = 1.0) -> None:
@@ -389,6 +492,330 @@ def test_mock_worker_emits_cache_events_and_controller_tracks_prefixes() -> None
         snapshot = controller.snapshot()
         assert len(snapshot["spine_rules"]) > 0
         assert len(snapshot["leaf_rules"]) > 0
+
+        worker.close()
+        controller.close()
+
+    asyncio.run(_run())
+
+
+def test_coalesced_refresh_reduces_ecmp_reprogramming() -> None:
+    """With coalescing enabled, rapid queue_updates should trigger only one
+    deferred reconciliation instead of one per event."""
+
+    async def _run() -> None:
+        adapter = InMemorySwitchAdapter()
+        controller = SDNController(
+            workers=[
+                WorkerPlacement(
+                    worker_id="worker0",
+                    leaf_switch="leaf0",
+                    worker_ip="10.0.0.1",
+                    worker_mac="02:00:00:00:00:01",
+                    spine_port=10,
+                    leaf_port=1,
+                ),
+                WorkerPlacement(
+                    worker_id="worker1",
+                    leaf_switch="leaf1",
+                    worker_ip="10.0.1.1",
+                    worker_mac="02:00:00:00:00:02",
+                    spine_port=11,
+                    leaf_port=2,
+                ),
+            ],
+            adapter=adapter,
+            spine_switch="s1",
+            coalesce_interval_s=0.05,
+        )
+        # Initial ECMP programming from start().
+        await controller.start()
+        initial_op_count = len(adapter.ops)
+
+        # Fire 10 rapid queue_update events — with coalescing, these should
+        # NOT each trigger a full reconciliation.
+        for load in range(10):
+            controller.handle_event(
+                CacheSyncEvent("queue_update", "worker0", load=load, timestamp=1.0)
+            )
+
+        # Immediately after: no ops should have been flushed yet (still coalescing).
+        assert len(adapter.ops) == initial_op_count
+
+        # Wait for the coalesce interval to pass.
+        await asyncio.sleep(0.1)
+
+        # Now exactly one deferred reconciliation should have happened.
+        post_coalesce_count = len(adapter.ops)
+        assert post_coalesce_count > initial_op_count
+
+        # A second burst should again coalesce into one refresh.
+        for load in range(10, 20):
+            controller.handle_event(
+                CacheSyncEvent("queue_update", "worker1", load=load, timestamp=2.0)
+            )
+        assert len(adapter.ops) == post_coalesce_count
+        await asyncio.sleep(0.1)
+        assert len(adapter.ops) > post_coalesce_count
+
+        controller.close()
+
+    asyncio.run(_run())
+
+
+def test_worker_load_update_throttling() -> None:
+    """Workers with load_update_interval_s > 0 should suppress rapid emissions."""
+
+    async def _run() -> None:
+        adapter = InMemorySwitchAdapter()
+        controller = SDNController(
+            workers=[
+                WorkerPlacement(
+                    worker_id="worker0",
+                    leaf_switch="leaf0",
+                    worker_ip="10.0.0.1",
+                    worker_mac="02:00:00:00:00:01",
+                    spine_port=10,
+                    leaf_port=1,
+                )
+            ],
+            host="127.0.0.1",
+            port=0,
+            admission_threshold=1,
+            adapter=adapter,
+        )
+        await controller.start()
+
+        worker = MockWorker(
+            host="127.0.0.1",
+            port=0,
+            ttft_ms=1.0,
+            tpot_ms=0.0,
+            max_num_seqs=8,
+            worker_id="worker0",
+            controller_host="127.0.0.1",
+            controller_port=controller.port,
+            load_update_interval_s=0.5,
+        )
+        await worker.start()
+
+        client = UDPClient(host="127.0.0.1", port=worker.port, timeout=5.0)
+
+        # Send 5 rapid requests — with 0.5s throttle, at most ~2 load updates
+        # should reach the controller instead of 10+ (2 per request).
+        tasks = []
+        for i in range(5):
+            tasks.append(
+                asyncio.create_task(
+                    client.send(
+                        {
+                            "endpoint": "generate",
+                            "prompt_token_ids": [i],
+                            "max_tokens": 1,
+                        }
+                    )
+                )
+            )
+        await asyncio.gather(*tasks)
+
+        # Wait for everything to settle.
+        await asyncio.sleep(0.1)
+
+        # All requests completed — load should be 0.
+        snapshot = controller.snapshot()
+        load_state = snapshot["worker_loads"]["worker0"]
+        assert load_state["load"] == 0
+
+        worker.close()
+        controller.close()
+
+    asyncio.run(_run())
+
+
+def test_queue_update_never_reroutes_prefix_rules() -> None:
+    """queue_update events should only affect ECMP weights, never reroute
+    installed prefix rules — the current target has the prefix cached."""
+    adapter = InMemorySwitchAdapter()
+    controller = SDNController(
+        workers=[
+            WorkerPlacement(
+                worker_id="worker0",
+                leaf_switch="leaf0",
+                worker_ip="10.0.0.1",
+                worker_mac="02:00:00:00:00:01",
+                spine_port=10,
+                leaf_port=1,
+            ),
+            WorkerPlacement(
+                worker_id="worker1",
+                leaf_switch="leaf1",
+                worker_ip="10.0.1.1",
+                worker_mac="02:00:00:00:00:02",
+                spine_port=11,
+                leaf_port=2,
+            ),
+        ],
+        admission_threshold=1,
+        adapter=adapter,
+        spine_switch="s1",
+    )
+
+    # Make worker0 the clear winner so allocs install the rule on worker0.
+    controller.handle_event(
+        CacheSyncEvent("queue_update", "worker1", load=10, timestamp=0.5)
+    )
+
+    # Install a prefix rule on worker0 (higher score due to worker1's load).
+    prefix = (0x1, 0x2, 0x3)
+    controller.handle_event(
+        CacheSyncEvent("alloc", "worker0", prefix_hashes=prefix, timestamp=1.0)
+    )
+    controller.handle_event(
+        CacheSyncEvent("alloc", "worker1", prefix_hashes=prefix, timestamp=2.0)
+    )
+    assert controller.spine_tcam.installed_rule((0x1,)).target_id == "worker0"
+    assert controller.leaf_tcam.installed_rule(prefix).target_id == "worker0"
+
+    # Massive load imbalance: worker0=1000, worker1=0.
+    # Prefix rule must NOT move — worker0 has the cache.
+    controller.handle_event(
+        CacheSyncEvent("queue_update", "worker0", load=1000, timestamp=3.0)
+    )
+    controller.handle_event(
+        CacheSyncEvent("queue_update", "worker1", load=0, timestamp=3.0)
+    )
+    assert controller.spine_tcam.installed_rule((0x1,)).target_id == "worker0"
+    assert controller.leaf_tcam.installed_rule(prefix).target_id == "worker0"
+
+
+def test_hysteresis_suppresses_reroute_on_alloc() -> None:
+    """When a new alloc arrives from a slightly-better-scoring worker,
+    hysteresis prevents the reroute unless the gap exceeds the threshold."""
+    adapter = InMemorySwitchAdapter()
+    controller = SDNController(
+        workers=[
+            WorkerPlacement(
+                worker_id="worker0",
+                leaf_switch="leaf0",
+                worker_ip="10.0.0.1",
+                worker_mac="02:00:00:00:00:01",
+                spine_port=10,
+                leaf_port=1,
+            ),
+            WorkerPlacement(
+                worker_id="worker1",
+                leaf_switch="leaf1",
+                worker_ip="10.0.1.1",
+                worker_mac="02:00:00:00:00:02",
+                spine_port=11,
+                leaf_port=2,
+            ),
+        ],
+        admission_threshold=1,
+        adapter=adapter,
+        spine_switch="s1",
+        reroute_score_threshold=0.3,
+    )
+
+    # Install prefix on worker0.
+    prefix = (0x1, 0x2, 0x3)
+    controller.handle_event(
+        CacheSyncEvent("alloc", "worker0", prefix_hashes=prefix, timestamp=1.0)
+    )
+    assert controller.spine_tcam.installed_rule((0x1,)).target_id == "worker0"
+
+    # worker1 also allocs, but both at load=0 → score gap 0 < 0.3 → no reroute.
+    controller.handle_event(
+        CacheSyncEvent("alloc", "worker1", prefix_hashes=prefix, timestamp=2.0)
+    )
+    assert controller.spine_tcam.installed_rule((0x1,)).target_id == "worker0"
+
+    # Now worker0 has significant load → alloc from worker1 should reroute.
+    controller.handle_event(
+        CacheSyncEvent("queue_update", "worker0", load=100, timestamp=3.0)
+    )
+    # Trigger a new alloc from worker1 to re-evaluate the prefix rule.
+    controller.handle_event(
+        CacheSyncEvent("alloc", "worker1", prefix_hashes=prefix, timestamp=4.0)
+    )
+    assert controller.spine_tcam.installed_rule((0x1,)).target_id == "worker1"
+
+
+def test_warmup_populates_both_tcam_and_worker_cache() -> None:
+    """After warm-up requests the controller TCAM and worker caches should
+    both contain the prefix-group entries."""
+
+    async def _run() -> None:
+        adapter = InMemorySwitchAdapter()
+        controller = SDNController(
+            workers=[
+                WorkerPlacement(
+                    worker_id="worker0",
+                    leaf_switch="leaf0",
+                    worker_ip="10.0.0.1",
+                    worker_mac="02:00:00:00:00:01",
+                    spine_port=10,
+                    leaf_port=1,
+                )
+            ],
+            host="127.0.0.1",
+            port=0,
+            admission_threshold=1,
+            adapter=adapter,
+        )
+        await controller.start()
+
+        worker = MockWorker(
+            host="127.0.0.1",
+            port=0,
+            kvswitch_port=0,
+            ttft_ms=1.0,
+            tpot_ms=0.0,
+            worker_id="worker0",
+            controller_host="127.0.0.1",
+            controller_port=controller.port,
+            max_cached_prefixes=8,
+            base_ttft_ms=10.0,
+            per_token_ttft_ms=0.5,
+        )
+        await worker.start()
+        assert worker.kvswitch_port is not None
+
+        prefix_hashes = compute_truncated_hashes([0] * 256, b"test-key")
+        kv_client = KVSwitchUDPClient(
+            host="127.0.0.1", port=worker.kvswitch_port, timeout=5.0
+        )
+        request = {
+            "endpoint": "generate",
+            "prompt_token_ids": [0] * 256,
+            "max_tokens": 1,
+        }
+
+        # First request: cold cache.
+        first = await kv_client.send(request, prefix_hashes=prefix_hashes, req_id=1)
+        assert first["matched_blocks"] == 0
+        cold_ttft = first["simulated_ttft_ms"]
+
+        await _wait_until(
+            lambda: controller.spine_tcam.installed_rule(tuple(prefix_hashes[:1]))
+            is not None,
+            timeout=2.0,
+        )
+
+        # Second request: worker cache warm → cache hits and lower TTFT.
+        second = await kv_client.send(request, prefix_hashes=prefix_hashes, req_id=2)
+        assert second["matched_blocks"] > 0
+        warm_ttft = second["simulated_ttft_ms"]
+        assert warm_ttft < cold_ttft
+
+        # TCAM rules installed.
+        assert len(controller.spine_tcam.snapshot()) > 0
+        assert len(controller.leaf_tcam.snapshot()) > 0
+
+        # Worker cache populated (via health endpoint).
+        health_client = UDPClient(host="127.0.0.1", port=worker.port, timeout=5.0)
+        health = await health_client.send({"endpoint": "health"})
+        assert health["cached_prefixes"] > 0
 
         worker.close()
         controller.close()
