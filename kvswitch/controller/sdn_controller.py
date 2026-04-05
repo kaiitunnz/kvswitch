@@ -37,30 +37,39 @@ EventType = Literal["alloc", "evict", "queue_update"]
 ECMP_BUCKETS = 32
 
 
-def parse_worker_placement(spec: str) -> "WorkerPlacement":
-    """Parse ``worker_id,leaf_switch,worker_ip,worker_mac,spine_port,leaf_port``."""
-    parts = [part.strip() for part in spec.split(",")]
-    if len(parts) != 6:
-        raise ValueError(
-            "worker spec must be "
-            "worker_id,leaf_switch,worker_ip,worker_mac,spine_port,leaf_port"
-        )
-    worker_id, leaf_switch, worker_ip, worker_mac, raw_spine_port, raw_leaf_port = parts
-    return WorkerPlacement(
-        worker_id=worker_id,
-        leaf_switch=leaf_switch,
-        worker_ip=worker_ip,
-        worker_mac=worker_mac,
-        spine_port=int(raw_spine_port),
-        leaf_port=int(raw_leaf_port),
-    )
-
-
 def parse_worker_placements(specs: str) -> list["WorkerPlacement"]:
-    """Parse ``;``-separated worker placement specs."""
-    placements = [
-        parse_worker_placement(spec) for spec in specs.split(";") if spec.strip()
-    ]
+    """Parse ``;``-separated worker placement specs.
+
+    Each spec is ``worker_id,leaf_switch,worker_ip,worker_mac,leaf_port,spine:port[+spine:port...]``.
+    The last field encodes per-spine port mappings, e.g. ``spine0:3+spine1:3``.
+    """
+    placements: list[WorkerPlacement] = []
+    for spec in specs.split(";"):
+        spec = spec.strip()
+        if not spec:
+            continue
+        parts = [p.strip() for p in spec.split(",")]
+        if len(parts) != 6:
+            raise ValueError(
+                "worker spec must be "
+                "worker_id,leaf_switch,worker_ip,worker_mac,leaf_port,"
+                "spine0:port+spine1:port"
+            )
+        worker_id, leaf_switch, w_ip, w_mac, raw_leaf_port, raw_spine_ports = parts
+        spine_ports = {}
+        for pair in raw_spine_ports.split("+"):
+            sw, port = pair.split(":")
+            spine_ports[sw.strip()] = int(port)
+        placements.append(
+            WorkerPlacement(
+                worker_id=worker_id,
+                leaf_switch=leaf_switch,
+                worker_ip=w_ip,
+                worker_mac=w_mac,
+                leaf_port=int(raw_leaf_port),
+                spine_ports=spine_ports,
+            )
+        )
     if not placements:
         raise ValueError("at least one worker placement is required")
     return placements
@@ -74,8 +83,8 @@ class WorkerPlacement:
     leaf_switch: str
     worker_ip: str
     worker_mac: str
-    spine_port: int
     leaf_port: int
+    spine_ports: dict[str, int]
 
 
 @dataclass(frozen=True)
@@ -172,14 +181,14 @@ class SDNController:
         alpha: float = 1.0,
         beta: float = 1.0,
         adapter: SwitchAdapter | None = None,
-        spine_switch: str = "s1",
+        spine_switches: list[str] | None = None,
         coalesce_interval_s: float = 0.0,
         reroute_score_threshold: float = 0.0,
     ) -> None:
         self._workers = {worker.worker_id: worker for worker in workers}
         self._server = UDPServer(host=host, port=port, handler=self._handle)
         self._adapter: SwitchAdapter = adapter or InMemorySwitchAdapter()
-        self._spine_switch = spine_switch
+        self._spine_switches = spine_switches or []
         self.alpha = alpha
         self.beta = beta
         self._reroute_score_threshold = reroute_score_threshold
@@ -201,7 +210,7 @@ class SDNController:
         }
         self._spine_locations: dict[tuple[int, ...], set[str]] = defaultdict(set)
         self._leaf_locations: dict[PrefixKey, set[str]] = defaultdict(set)
-        self._spine_ecmp_bucket_map: dict[int, str] = {}
+        self._spine_ecmp_bucket_maps: dict[str, dict[int, str]] = {}
         self._leaf_ecmp_bucket_maps: dict[str, dict[int, str]] = defaultdict(dict)
 
         # Coalescing: instead of reconciling on every queue_update, we schedule
@@ -343,15 +352,17 @@ class SDNController:
             candidates, key=lambda worker_id: (self._worker_score(worker_id), worker_id)
         )
 
-    def _spine_add_op(self, prefix: tuple[int, ...], worker_id: str) -> TableAddOp:
+    def _spine_add_op(
+        self, prefix: tuple[int, ...], worker_id: str, spine_switch: str
+    ) -> TableAddOp:
         worker = self._workers[worker_id]
         h0 = prefix[0]
         return TableAddOp(
-            switch=self._spine_switch,
+            switch=spine_switch,
             table="spine_prefix_route",
             action="route_to_pod",
             match={"hdr.kvswitch.h0": f"0x{h0:08x}&&&0xffffffff"},
-            action_params={"port": worker.spine_port},
+            action_params={"port": worker.spine_ports[spine_switch]},
             priority=1,
         )
 
@@ -383,10 +394,12 @@ class SDNController:
             ),
         )
 
-    def _spine_delete_op(self, prefix: tuple[int, ...]) -> TableDeleteOp:
+    def _spine_delete_op(
+        self, prefix: tuple[int, ...], spine_switch: str
+    ) -> TableDeleteOp:
         h0 = prefix[0]
         return TableDeleteOp(
-            switch=self._spine_switch,
+            switch=spine_switch,
             table="spine_prefix_route",
             match={"hdr.kvswitch.h0": f"0x{h0:08x}&&&0xffffffff"},
             priority=1,
@@ -450,34 +463,34 @@ class SDNController:
         _, evicted = self.spine_tcam.install(
             prefix, worker_id, hit_count=hit_count, now=now
         )
-        ops: list[SwitchOp] = []
         previous_worker_id = existing.target_id if existing is not None else None
+        # Fan out spine ops to all spines.
+        all_ops: list[SwitchOp] = []
+        for sw in self._spine_switches:
+            ops: list[SwitchOp] = []
+            if previous_worker_id is not None:
+                ops.append(self._spine_delete_op(prefix, sw))
+            if evicted is not None:
+                ops.append(self._spine_delete_op(evicted[0], sw))
+            ops.append(self._spine_add_op(prefix, worker_id, sw))
+            self._adapter.apply_ops(ops)
+            all_ops.extend(ops)
         if previous_worker_id is not None:
-            ops.append(self._spine_delete_op(prefix))
             logger.debug(
-                "Rerouting spine prefix rule prefix=%s old_worker=%s new_worker=%s switch=%s",
+                "Rerouting spine prefix rule prefix=%s old=%s new=%s on %d spines",
                 format_prefix_key(prefix),
                 previous_worker_id,
                 worker_id,
-                self._spine_switch,
+                len(self._spine_switches),
             )
-        if evicted is not None:
-            ops.append(self._spine_delete_op(evicted[0]))
+        else:
             logger.debug(
-                "Evicting spine prefix rule prefix=%s previous_worker=%s",
-                format_prefix_key(evicted[0]),
-                evicted[1].target_id,
+                "Installing spine prefix rule prefix=%s worker=%s on %d spines",
+                format_prefix_key(prefix),
+                worker_id,
+                len(self._spine_switches),
             )
-        add_op = self._spine_add_op(prefix, worker_id)
-        ops.append(add_op)
-        logger.debug(
-            "Installing spine prefix rule prefix=%s worker=%s switch=%s",
-            format_prefix_key(prefix),
-            worker_id,
-            self._spine_switch,
-        )
-        self._adapter.apply_ops(ops)
-        return ops
+        return all_ops
 
     def _maybe_install_leaf_rule(
         self,
@@ -559,14 +572,17 @@ class SDNController:
         self._spine_locations.pop(prefix, None)
         if self.spine_tcam.remove(prefix) is None:
             return []
-        op = self._spine_delete_op(prefix)
+        ops: list[SwitchOp] = []
+        for sw in self._spine_switches:
+            op = self._spine_delete_op(prefix, sw)
+            ops.append(op)
+            self._adapter.apply_ops([op])
         logger.debug(
-            "Removing spine prefix rule prefix=%s switch=%s",
+            "Removing spine prefix rule prefix=%s on %d spines",
             format_prefix_key(prefix),
-            self._spine_switch,
+            len(self._spine_switches),
         )
-        self._adapter.apply_ops([op])
-        return [op]
+        return ops
 
     def _apply_leaf_eviction(
         self,
@@ -689,28 +705,33 @@ class SDNController:
         for worker_id, placement in self._workers.items():
             per_leaf[placement.leaf_switch] += self._inverse_queue_weight(worker_id)
         bucket_map = self._allocate_buckets(per_leaf)
-        if bucket_map == self._spine_ecmp_bucket_map:
-            return []
-        leaves = {
-            placement.leaf_switch: placement.spine_port
-            for placement in self._workers.values()
-        }
-        ops: list[SwitchOp] = [
-            TableClearOp(switch=self._spine_switch, table="spine_ecmp_select")
-        ]
-        for bucket, leaf_switch in bucket_map.items():
-            ops.append(
-                TableAddOp(
-                    switch=self._spine_switch,
-                    table="spine_ecmp_select",
-                    action="route_to_pod",
-                    match={"meta.ecmp_bucket": bucket},
-                    action_params={"port": leaves[leaf_switch]},
+
+        all_ops: list[SwitchOp] = []
+        for sw in self._spine_switches:
+            if bucket_map == self._spine_ecmp_bucket_maps.get(sw):
+                continue
+            # Build per-spine leaf→port mapping.
+            leaves: dict[str, int] = {}
+            for placement in self._workers.values():
+                if placement.leaf_switch not in leaves:
+                    leaves[placement.leaf_switch] = placement.spine_ports[sw]
+            ops: list[SwitchOp] = [
+                TableClearOp(switch=sw, table="spine_ecmp_select")
+            ]
+            for bucket, leaf_switch in bucket_map.items():
+                ops.append(
+                    TableAddOp(
+                        switch=sw,
+                        table="spine_ecmp_select",
+                        action="route_to_pod",
+                        match={"meta.ecmp_bucket": bucket},
+                        action_params={"port": leaves[leaf_switch]},
+                    )
                 )
-            )
-        self._adapter.apply_ops(ops)
-        self._spine_ecmp_bucket_map = dict(bucket_map)
-        return ops
+            self._adapter.apply_ops(ops)
+            self._spine_ecmp_bucket_maps[sw] = dict(bucket_map)
+            all_ops.extend(ops)
+        return all_ops
 
     def _program_leaf_ecmp(self) -> list[SwitchOp]:
         all_ops: list[SwitchOp] = []

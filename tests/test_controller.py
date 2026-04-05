@@ -47,7 +47,7 @@ def test_controller_installs_reroutes_and_deletes_leaf_rules_on_correct_switch()
                 leaf_switch="leaf0",
                 worker_ip="10.0.0.1",
                 worker_mac="02:00:00:00:00:01",
-                spine_port=10,
+                spine_ports={"s1": 10},
                 leaf_port=1,
             ),
             WorkerPlacement(
@@ -55,7 +55,7 @@ def test_controller_installs_reroutes_and_deletes_leaf_rules_on_correct_switch()
                 leaf_switch="leaf1",
                 worker_ip="10.0.1.1",
                 worker_mac="02:00:00:00:00:02",
-                spine_port=11,
+                spine_ports={"s1": 11},
                 leaf_port=2,
             ),
         ],
@@ -64,7 +64,7 @@ def test_controller_installs_reroutes_and_deletes_leaf_rules_on_correct_switch()
         max_leaf_entries=1,
         beta=1.0,
         adapter=adapter,
-        spine_switch="s1",
+        spine_switches=["s1"],
     )
 
     prefix = (0x1, 0x2, 0x3)
@@ -152,7 +152,7 @@ def test_sticky_prefix_rules_resist_alloc_from_lighter_worker() -> None:
                 leaf_switch="leaf0",
                 worker_ip="10.0.0.1",
                 worker_mac="02:00:00:00:00:01",
-                spine_port=10,
+                spine_ports={"s1": 10},
                 leaf_port=1,
             ),
             WorkerPlacement(
@@ -160,13 +160,13 @@ def test_sticky_prefix_rules_resist_alloc_from_lighter_worker() -> None:
                 leaf_switch="leaf1",
                 worker_ip="10.0.1.1",
                 worker_mac="02:00:00:00:00:02",
-                spine_port=11,
+                spine_ports={"s1": 11},
                 leaf_port=2,
             ),
         ],
         admission_threshold=1,
         adapter=adapter,
-        spine_switch="s1",
+        spine_switches=["s1"],
     )
 
     controller.handle_event(
@@ -215,7 +215,7 @@ def test_controller_skips_prefix_reinstall_when_target_is_unchanged() -> None:
                 leaf_switch="leaf0",
                 worker_ip="10.0.0.1",
                 worker_mac="02:00:00:00:00:01",
-                spine_port=10,
+                spine_ports={"s1": 10},
                 leaf_port=1,
             ),
             WorkerPlacement(
@@ -223,13 +223,13 @@ def test_controller_skips_prefix_reinstall_when_target_is_unchanged() -> None:
                 leaf_switch="leaf1",
                 worker_ip="10.0.1.1",
                 worker_mac="02:00:00:00:00:02",
-                spine_port=11,
+                spine_ports={"s1": 11},
                 leaf_port=2,
             ),
         ],
         admission_threshold=1,
         adapter=adapter,
-        spine_switch="s1",
+        spine_switches=["s1"],
     )
 
     controller.handle_event(
@@ -262,7 +262,7 @@ def test_controller_skips_noop_ecmp_refresh() -> None:
                 leaf_switch="leaf0",
                 worker_ip="10.0.0.1",
                 worker_mac="02:00:00:00:00:01",
-                spine_port=10,
+                spine_ports={"s1": 10},
                 leaf_port=1,
             ),
             WorkerPlacement(
@@ -270,12 +270,12 @@ def test_controller_skips_noop_ecmp_refresh() -> None:
                 leaf_switch="leaf1",
                 worker_ip="10.0.1.1",
                 worker_mac="02:00:00:00:00:02",
-                spine_port=11,
+                spine_ports={"s1": 11},
                 leaf_port=2,
             ),
         ],
         adapter=adapter,
-        spine_switch="s1",
+        spine_switches=["s1"],
     )
 
     first_ops = controller._refresh_ecmp_weights()
@@ -317,7 +317,7 @@ def test_mock_worker_emits_queue_backlog_metrics_to_controller() -> None:
                     leaf_switch="leaf0",
                     worker_ip="10.0.0.1",
                     worker_mac="02:00:00:00:00:01",
-                    spine_port=10,
+                    spine_ports={"s1": 10},
                     leaf_port=1,
                 )
             ],
@@ -400,7 +400,7 @@ def test_mock_worker_emits_cache_events_and_controller_tracks_prefixes() -> None
                     leaf_switch="leaf0",
                     worker_ip="10.0.0.1",
                     worker_mac="02:00:00:00:00:01",
-                    spine_port=10,
+                    spine_ports={"s1": 10},
                     leaf_port=1,
                 )
             ],
@@ -471,7 +471,7 @@ def test_coalesced_refresh_reduces_ecmp_reprogramming() -> None:
                     leaf_switch="leaf0",
                     worker_ip="10.0.0.1",
                     worker_mac="02:00:00:00:00:01",
-                    spine_port=10,
+                    spine_ports={"s1": 10},
                     leaf_port=1,
                 ),
                 WorkerPlacement(
@@ -479,12 +479,12 @@ def test_coalesced_refresh_reduces_ecmp_reprogramming() -> None:
                     leaf_switch="leaf1",
                     worker_ip="10.0.1.1",
                     worker_mac="02:00:00:00:00:02",
-                    spine_port=11,
+                    spine_ports={"s1": 11},
                     leaf_port=2,
                 ),
             ],
             adapter=adapter,
-            spine_switch="s1",
+            spine_switches=["s1"],
             coalesce_interval_s=0.05,
         )
         # Initial ECMP programming from start().
@@ -534,7 +534,7 @@ def test_worker_load_update_throttling() -> None:
                     leaf_switch="leaf0",
                     worker_ip="10.0.0.1",
                     worker_mac="02:00:00:00:00:01",
-                    spine_port=10,
+                    spine_ports={"s1": 10},
                     leaf_port=1,
                 )
             ],
@@ -602,7 +602,7 @@ def test_queue_update_never_reroutes_prefix_rules() -> None:
                 leaf_switch="leaf0",
                 worker_ip="10.0.0.1",
                 worker_mac="02:00:00:00:00:01",
-                spine_port=10,
+                spine_ports={"s1": 10},
                 leaf_port=1,
             ),
             WorkerPlacement(
@@ -610,13 +610,13 @@ def test_queue_update_never_reroutes_prefix_rules() -> None:
                 leaf_switch="leaf1",
                 worker_ip="10.0.1.1",
                 worker_mac="02:00:00:00:00:02",
-                spine_port=11,
+                spine_ports={"s1": 11},
                 leaf_port=2,
             ),
         ],
         admission_threshold=1,
         adapter=adapter,
-        spine_switch="s1",
+        spine_switches=["s1"],
     )
 
     # Make worker0 the clear winner so allocs install the rule on worker0.
@@ -658,7 +658,7 @@ def test_sticky_rule_transfers_on_owner_eviction() -> None:
                 leaf_switch="leaf0",
                 worker_ip="10.0.0.1",
                 worker_mac="02:00:00:00:00:01",
-                spine_port=10,
+                spine_ports={"s1": 10},
                 leaf_port=1,
             ),
             WorkerPlacement(
@@ -666,13 +666,13 @@ def test_sticky_rule_transfers_on_owner_eviction() -> None:
                 leaf_switch="leaf1",
                 worker_ip="10.0.1.1",
                 worker_mac="02:00:00:00:00:02",
-                spine_port=11,
+                spine_ports={"s1": 11},
                 leaf_port=2,
             ),
         ],
         admission_threshold=1,
         adapter=adapter,
-        spine_switch="s1",
+        spine_switches=["s1"],
     )
 
     prefix = (0x1, 0x2, 0x3)
@@ -708,7 +708,7 @@ def test_warmup_populates_both_tcam_and_worker_cache() -> None:
                     leaf_switch="leaf0",
                     worker_ip="10.0.0.1",
                     worker_mac="02:00:00:00:00:01",
-                    spine_port=10,
+                    spine_ports={"s1": 10},
                     leaf_port=1,
                 )
             ],
@@ -792,7 +792,7 @@ def test_oob_controller_receives_events_on_alternate_bind_address() -> None:
                     leaf_switch="leaf0",
                     worker_ip="10.0.0.1",
                     worker_mac="02:00:00:00:00:01",
-                    spine_port=10,
+                    spine_ports={"s1": 10},
                     leaf_port=1,
                 )
             ],
