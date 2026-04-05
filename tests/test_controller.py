@@ -775,3 +775,74 @@ def test_warmup_populates_both_tcam_and_worker_cache() -> None:
         controller.close()
 
     asyncio.run(_run())
+
+
+def test_oob_controller_receives_events_on_alternate_bind_address() -> None:
+    """The controller can bind to any IP (e.g. an OOB management address)
+    and workers can send events there.  This validates the OOB path without
+    requiring actual network namespaces."""
+
+    async def _run() -> None:
+        adapter = InMemorySwitchAdapter()
+        # Bind to 127.0.0.1 (simulates the control-plane IP in production).
+        controller = SDNController(
+            workers=[
+                WorkerPlacement(
+                    worker_id="worker0",
+                    leaf_switch="leaf0",
+                    worker_ip="10.0.0.1",
+                    worker_mac="02:00:00:00:00:01",
+                    spine_port=10,
+                    leaf_port=1,
+                )
+            ],
+            host="127.0.0.1",
+            port=0,
+            admission_threshold=1,
+            adapter=adapter,
+        )
+        await controller.start()
+        controller_port = controller.port
+
+        # Worker sends events directly to the controller (no relay).
+        worker = MockWorker(
+            host="127.0.0.1",
+            port=0,
+            kvswitch_port=0,
+            ttft_ms=1.0,
+            worker_id="worker0",
+            controller_host="127.0.0.1",
+            controller_port=controller_port,
+            max_cached_prefixes=8,
+        )
+        await worker.start()
+        assert worker.kvswitch_port is not None
+
+        prefix_hashes = compute_truncated_hashes([0] * 256, b"oob-key")
+        kv_client = KVSwitchUDPClient(
+            host="127.0.0.1", port=worker.kvswitch_port, timeout=5.0
+        )
+        await kv_client.send(
+            {"endpoint": "generate", "prompt_token_ids": [0] * 256, "max_tokens": 1},
+            prefix_hashes=prefix_hashes,
+            req_id=1,
+        )
+
+        # Events should reach the controller via the direct path.
+        await _wait_until(
+            lambda: controller.spine_tcam.installed_rule(tuple(prefix_hashes[:1]))
+            is not None,
+            timeout=2.0,
+        )
+        assert len(controller.spine_tcam.snapshot()) > 0
+
+        # Verify load state was updated (queue_update events received).
+        await _wait_until(
+            lambda: controller.worker_loads["worker0"].load == 0,
+            timeout=2.0,
+        )
+
+        worker.close()
+        controller.close()
+
+    asyncio.run(_run())

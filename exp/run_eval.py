@@ -50,6 +50,7 @@ from kvswitch.eval.workload import (
     save_workload,
 )
 from kvswitch.network.bmv2 import BMv2Switch, reset_device_ids
+from kvswitch.network.control_plane import ControlPlane
 from kvswitch.network.topology import (
     CONTROLLER_IP,
     KVSWITCH_SERVICE_IP,
@@ -900,113 +901,87 @@ def run_baseline_kvswitch(
 ) -> list[RequestMetric]:
     """KVSwitch: SDN controller populates TCAM; switches route shim-header traffic."""
     logger.info("--- Baseline: KVSwitch ---")
-
-    # Assign the controller IP to a root-namespace interface so that
-    # Mininet workers can send cache events to the controller, which
-    # runs in-process (root namespace) with a FinsyWriter.
-    _setup_root_ns_controller_ip(net, ROOT_NS_CONTROLLER_IP)
     _configure_kvswitch_service(net, n_workers)
 
-    # Build worker placements from the live topology.
     workers_arg = _controller_workers_arg(net, n_workers)
     worker_placements = parse_worker_placements(workers_arg)
 
-    # Create and start the controller in-process with the FinsyWriter.
-    controller = SDNController(
-        workers=worker_placements,
-        host=ROOT_NS_CONTROLLER_IP,
-        port=CONTROLLER_PORT,
-        adapter=adapter,
-        spine_switch="s1",
-        coalesce_interval_s=2.0,
-        admission_threshold=admission_threshold,
-        reroute_score_threshold=0.2,
-    )
-    controller_runtime.run(controller.start())
-    logger.info(
-        "SDN controller running in root namespace on %s:%d",
-        ROOT_NS_CONTROLLER_IP,
-        CONTROLLER_PORT,
-    )
-
-    # Start a UDP relay in the Mininet controller host to forward cache events
-    relay_host, relay_log = _start_controller_relay(
-        net,
-        upstream_host=ROOT_NS_CONTROLLER_IP,
-        upstream_port=CONTROLLER_PORT,
-    )
-    logger.info(
-        "Started controller relay on %s:%d -> %s:%d",
-        CONTROLLER_IP,
-        CONTROLLER_PORT,
-        ROOT_NS_CONTROLLER_IP,
-        CONTROLLER_PORT,
-    )
-
-    # Start workers with controller connection and KVSwitch listener.
-    client = _get_node(net, "client")
-    try:
-        _wait_for_service(client, CONTROLLER_IP, CONTROLLER_PORT, timeout=30.0)
-    except TimeoutError:
-        logger.error("Controller relay log:\n%s", relay_host.cmd(f"cat {relay_log}"))
-        _kill_bg(relay_host)
-        controller.close()
-        raise
-
-    _start_workers(
-        net,
-        n_workers,
-        tpot_ms,
-        max_output_tokens,
-        controller_host=CONTROLLER_IP,
-        controller_port=CONTROLLER_PORT,
-        kvswitch_port=KVSWITCH_UDP_PORT,
-        base_ttft_ms=base_ttft_ms,
-        per_token_ttft_ms=per_token_ttft_ms,
-        ttft_ms=ttft_ms,
-    )
-
-    # Warm-up: send requests to populate both TCAM prefix rules and worker
-    # caches.  Workers stay running so switch and cache state are consistent.
-    warmup_workload = _build_warmup_workload(
-        workload_path, n_per_group=max(admission_threshold, 10)
-    )
-    if warmup_workload:
-        warmup_path = "/tmp/eval_warmup.json"
-        with open(warmup_path, "w") as f:
-            json.dump(warmup_workload, f)
+    # Control-plane network — context manager guarantees cleanup even on error.
+    with ControlPlane(net, n_workers) as cp:
+        # Start the controller bound to the OOB bridge IP.
+        controller_ip = cp.controller_ip
+        controller = SDNController(
+            workers=worker_placements,
+            host=controller_ip,
+            port=CONTROLLER_PORT,
+            adapter=adapter,
+            spine_switch="s1",
+            coalesce_interval_s=2.0,
+            admission_threshold=admission_threshold,
+            reroute_score_threshold=0.2,
+        )
+        controller_runtime.run(controller.start())
         logger.info(
-            "Running %d warm-up requests to populate TCAM rules and caches...",
-            len(warmup_workload),
-        )
-        _collect_results(
-            client,
-            warmup_path,
-            KVSWITCH_SERVICE_IP,
-            KVSWITCH_UDP_PORT,
-            client_timeout,
-            kvswitch=True,
-        )
-        time.sleep(1.0)
-        logger.info(
-            "Warm-up complete. Controller snapshot: spine_rules=%d leaf_rules=%d",
-            len(controller.spine_tcam.snapshot()),
-            len(controller.leaf_tcam.snapshot()),
+            "SDN controller running on control-plane network %s:%d",
+            controller_ip,
+            CONTROLLER_PORT,
         )
 
-    try:
-        raw = _collect_results(
-            client,
-            workload_path,
-            KVSWITCH_SERVICE_IP,
-            KVSWITCH_UDP_PORT,
-            client_timeout,
-            kvswitch=True,
+        # Workers send events directly to the OOB controller IP.
+        client = _get_node(net, "client")
+        _start_workers(
+            net,
+            n_workers,
+            tpot_ms,
+            max_output_tokens,
+            controller_host=controller_ip,
+            controller_port=CONTROLLER_PORT,
+            kvswitch_port=KVSWITCH_UDP_PORT,
+            base_ttft_ms=base_ttft_ms,
+            per_token_ttft_ms=per_token_ttft_ms,
+            ttft_ms=ttft_ms,
         )
-    finally:
-        controller.close()
-        _kill_bg(relay_host)
-        _stop_workers(net, n_workers)
+
+        # Warm-up: send requests to populate both TCAM prefix rules and worker
+        # caches.  Workers stay running so switch and cache state are consistent.
+        warmup_workload = _build_warmup_workload(
+            workload_path, n_per_group=max(admission_threshold, 10)
+        )
+        if warmup_workload:
+            warmup_path = "/tmp/eval_warmup.json"
+            with open(warmup_path, "w") as f:
+                json.dump(warmup_workload, f)
+            logger.info(
+                "Running %d warm-up requests to populate TCAM rules and caches...",
+                len(warmup_workload),
+            )
+            _collect_results(
+                client,
+                warmup_path,
+                KVSWITCH_SERVICE_IP,
+                KVSWITCH_UDP_PORT,
+                client_timeout,
+                kvswitch=True,
+            )
+            time.sleep(1.0)
+            logger.info(
+                "Warm-up complete. Controller snapshot: spine_rules=%d leaf_rules=%d",
+                len(controller.spine_tcam.snapshot()),
+                len(controller.leaf_tcam.snapshot()),
+            )
+
+        try:
+            raw = _collect_results(
+                client,
+                workload_path,
+                KVSWITCH_SERVICE_IP,
+                KVSWITCH_UDP_PORT,
+                client_timeout,
+                kvswitch=True,
+            )
+        finally:
+            controller.close()
+            _stop_workers(net, n_workers)
 
     return _to_request_metrics(raw, "kvswitch")
 
@@ -1019,7 +994,7 @@ def run_baseline_kvswitch(
 BASELINE_REGISTRY = {
     "l4_rr": {"needs_router": False, "needs_controller": False},
     "l7": {"needs_router": True, "needs_controller": False},
-    "kvswitch": {"needs_router": False, "needs_controller": True},
+    "kvswitch": {"needs_router": False, "needs_controller": False},
 }
 
 
