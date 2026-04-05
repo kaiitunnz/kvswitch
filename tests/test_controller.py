@@ -10,7 +10,7 @@ from kvswitch.controller import (
     TableAddOp,
     TcamManager,
 )
-from kvswitch.controller.sdn_controller import WorkerPlacement
+from kvswitch.controller.sdn_controller import ECMP_BUCKETS, WorkerPlacement
 from kvswitch.mock.worker import MockWorker
 from kvswitch.sdk.client import KVSwitchUDPClient
 from kvswitch.sdk.hashing import compute_truncated_hashes
@@ -92,7 +92,7 @@ def test_controller_installs_reroutes_and_deletes_leaf_rules_on_correct_switch()
     assert len(leaf_adds) > 0
     assert adapter.table_adds(switch="s1", table="spine_prefix_route")
     assert controller.spine_tcam.installed_rule((0x1,)).target_id == "worker0"
-    assert controller.leaf_tcam.installed_rule(prefix).target_id == "worker0"
+    assert controller.leaf_tcams["leaf0"].installed_rule(prefix).target_id == "worker0"
 
     controller.handle_event(
         CacheSyncEvent("queue_update", "worker0", load=8, timestamp=2.5)
@@ -100,13 +100,15 @@ def test_controller_installs_reroutes_and_deletes_leaf_rules_on_correct_switch()
     controller.handle_event(
         CacheSyncEvent("queue_update", "worker1", load=0, timestamp=2.5)
     )
-    # Sticky: alloc from worker1 does NOT reroute — worker0 keeps the rule.
-    sticky_ops = controller.handle_event(
+    # Alloc from worker1 triggers multi-leaf expansion: leaf1 gets a rule
+    # and the spine ECMP group now includes both leaves.
+    expand_ops = controller.handle_event(
         CacheSyncEvent("alloc", "worker1", prefix_hashes=prefix, timestamp=3.0)
     )
-    assert sticky_ops == []
-    assert controller.spine_tcam.installed_rule((0x1,)).target_id == "worker0"
-    assert controller.leaf_tcam.installed_rule(prefix).target_id == "worker0"
+    assert len(expand_ops) > 0
+    assert controller.spine_tcam.installed_rule((0x1,)) is not None
+    assert controller.leaf_tcams["leaf0"].installed_rule(prefix).target_id == "worker0"
+    assert controller.leaf_tcams["leaf1"].installed_rule(prefix).target_id == "worker1"
 
     other_prefix = (0x9, 0x8, 0x7)
     controller.handle_event(
@@ -197,13 +199,13 @@ def test_sticky_prefix_rules_resist_alloc_from_lighter_worker() -> None:
     )
     assert controller.spine_tcam.installed_rule((0x1,)).target_id == "worker1"
 
-    # Second alloc from worker0 — worker1 still owns it (sticky).
-    sticky_ops = controller.handle_event(
+    # Second alloc from worker0 — expands to leaf0 but leaf1 rule stays.
+    controller.handle_event(
         CacheSyncEvent("alloc", "worker0", prefix_hashes=prefix, timestamp=3.0)
     )
-    assert sticky_ops == []
-    assert controller.spine_tcam.installed_rule((0x1,)).target_id == "worker1"
-    assert controller.leaf_tcam.installed_rule(prefix).target_id == "worker1"
+    # Multi-leaf expansion: leaf0 gets a rule, spine ECMP reweighted.
+    assert controller.leaf_tcams["leaf1"].installed_rule(prefix).target_id == "worker1"
+    assert controller.leaf_tcams["leaf0"].installed_rule(prefix).target_id == "worker0"
 
 
 def test_controller_skips_prefix_reinstall_when_target_is_unchanged() -> None:
@@ -440,7 +442,7 @@ def test_mock_worker_emits_cache_events_and_controller_tracks_prefixes() -> None
 
         expected_prefix = tuple(prefix_hashes)
         await _wait_until(
-            lambda: controller.leaf_tcam.installed_rule(expected_prefix) is not None,
+            lambda: any(tcam.installed_rule(expected_prefix) is not None for tcam in controller.leaf_tcams.values()),
             timeout=2.0,
         )
 
@@ -620,7 +622,7 @@ def test_score_conditional_reroute_on_queue_update() -> None:
         reroute_score_threshold=50.0,
     )
 
-    # Install prefix rule on worker0; both workers have the prefix cached.
+    # Install prefix on both workers (cross-leaf).
     prefix = (0x1, 0x2, 0x3)
     controller.handle_event(
         CacheSyncEvent("alloc", "worker0", prefix_hashes=prefix, timestamp=1.0)
@@ -628,24 +630,32 @@ def test_score_conditional_reroute_on_queue_update() -> None:
     controller.handle_event(
         CacheSyncEvent("alloc", "worker1", prefix_hashes=prefix, timestamp=2.0)
     )
-    assert controller.spine_tcam.installed_rule((0x1,)).target_id == "worker0"
+    assert controller.spine_tcam.installed_rule((0x1,)) is not None
+    # Both leaves should have leaf rules.
+    assert controller.leaf_tcams["leaf0"].installed_rule(prefix) is not None
+    assert controller.leaf_tcams["leaf1"].installed_rule(prefix) is not None
 
-    # Small load delta (20 < threshold 50): rule stays on worker0.
+    # Small load delta (20 < threshold 50): leaf rules stay.
     controller.handle_event(
         CacheSyncEvent("queue_update", "worker0", load=20, timestamp=3.0)
     )
     controller.handle_event(
         CacheSyncEvent("queue_update", "worker1", load=0, timestamp=3.0)
     )
-    assert controller.spine_tcam.installed_rule((0x1,)).target_id == "worker0"
-    assert controller.leaf_tcam.installed_rule(prefix).target_id == "worker0"
+    assert controller.leaf_tcams["leaf0"].installed_rule(prefix).target_id == "worker0"
 
-    # Large load delta (1000 >> threshold 50): reroutes to worker1.
+    # Large load delta (1000 >> threshold 50): spine ECMP shifts weight
+    # toward leaf1.  Leaf rules unchanged (each leaf's local best stays).
     controller.handle_event(
         CacheSyncEvent("queue_update", "worker0", load=1000, timestamp=4.0)
     )
-    assert controller.spine_tcam.installed_rule((0x1,)).target_id == "worker1"
-    assert controller.leaf_tcam.installed_rule(prefix).target_id == "worker1"
+    # The spine ECMP group should now heavily favor leaf1.
+    spine_key = (0x1,)
+    group_id = controller._prefix_group_ids.get(spine_key)
+    assert group_id is not None
+    bucket_map = controller._prefix_ecmp_bucket_maps["s1"].get(spine_key, {})
+    leaf1_buckets = sum(1 for leaf in bucket_map.values() if leaf == "leaf1")
+    assert leaf1_buckets > ECMP_BUCKETS // 2  # Majority goes to leaf1
 
 
 def test_sticky_rule_transfers_on_owner_eviction() -> None:
@@ -683,17 +693,16 @@ def test_sticky_rule_transfers_on_owner_eviction() -> None:
     controller.handle_event(
         CacheSyncEvent("alloc", "worker1", prefix_hashes=prefix, timestamp=2.0)
     )
-    assert controller.spine_tcam.installed_rule((0x1,)).target_id == "worker0"
+    assert controller.spine_tcam.installed_rule((0x1,)) is not None
 
-    # worker0 evicts → rule should transfer to worker1.
-    evict_ops = controller.handle_event(
+    # worker0 evicts → ECMP group shrinks to leaf1 only.
+    controller.handle_event(
         CacheSyncEvent("evict", "worker0", prefix_hashes=prefix, timestamp=3.0)
     )
     assert controller.spine_tcam.installed_rule((0x1,)).target_id == "worker1"
-    assert any(
-        isinstance(op, TableAddOp) and op.action_params["port"] == 11
-        for op in evict_ops
-    )
+    # After eviction, leaf0 rule should be gone.
+    assert controller.leaf_tcams["leaf0"].installed_rule(prefix) is None
+    assert controller.leaf_tcams["leaf1"].installed_rule(prefix) is not None
 
 
 def test_warmup_populates_both_tcam_and_worker_cache() -> None:
@@ -765,7 +774,7 @@ def test_warmup_populates_both_tcam_and_worker_cache() -> None:
 
         # TCAM rules installed.
         assert len(controller.spine_tcam.snapshot()) > 0
-        assert len(controller.leaf_tcam.snapshot()) > 0
+        assert any(len(tcam.snapshot()) > 0 for tcam in controller.leaf_tcams.values())
 
         # Worker cache populated (via health endpoint).
         health_client = UDPClient(host="127.0.0.1", port=worker.port, timeout=5.0)
@@ -873,13 +882,22 @@ def test_multi_spine_prefix_rule_replicated_to_all_spines() -> None:
         CacheSyncEvent("alloc", "worker0", prefix_hashes=prefix, timestamp=1.0)
     )
 
-    # Both spines should have the prefix rule.
-    spine0_adds = adapter.table_adds(switch="spine0", table="spine_prefix_route")
-    spine1_adds = adapter.table_adds(switch="spine1", table="spine_prefix_route")
-    assert len(spine0_adds) == 1
-    assert len(spine1_adds) == 1
-    assert spine0_adds[0].action_params["port"] == 2
-    assert spine1_adds[0].action_params["port"] == 2
+    # Both spines should have the prefix route (set_prefix_ecmp_group)
+    # and per-prefix ECMP entries (route_to_pod).
+    spine0_route = adapter.table_adds(switch="spine0", table="spine_prefix_route")
+    spine1_route = adapter.table_adds(switch="spine1", table="spine_prefix_route")
+    assert len(spine0_route) == 1
+    assert len(spine1_route) == 1
+    assert "group_id" in spine0_route[0].action_params
+    assert "group_id" in spine1_route[0].action_params
+
+    spine0_ecmp = adapter.table_adds(switch="spine0", table="spine_prefix_ecmp")
+    spine1_ecmp = adapter.table_adds(switch="spine1", table="spine_prefix_ecmp")
+    assert len(spine0_ecmp) > 0
+    assert len(spine1_ecmp) > 0
+    # All ECMP entries should route to port 2 (single leaf).
+    assert all(op.action_params["port"] == 2 for op in spine0_ecmp)
+    assert all(op.action_params["port"] == 2 for op in spine1_ecmp)
 
 
 def test_multi_spine_ecmp_programmed_per_spine() -> None:

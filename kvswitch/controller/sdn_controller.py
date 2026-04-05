@@ -666,15 +666,32 @@ class SDNController:
         if not candidates:
             return []
         candidates.discard(worker_id)
+
+        all_ops: list[SwitchOp] = []
+        # Clean up leaf rules on leaves that lost all local candidates.
+        evicted_leaf = self._workers[worker_id].leaf_switch
+        remaining_on_leaf = any(
+            self._workers[c].leaf_switch == evicted_leaf for c in candidates
+        )
+        if not remaining_on_leaf:
+            tcam = self.leaf_tcams.get(evicted_leaf)
+            if tcam is not None:
+                removed = tcam.remove(prefix)
+                if removed is not None:
+                    _, op = self._leaf_delete_op(prefix, removed.target_id)
+                    self._adapter.apply_ops([op])
+                    all_ops.append(op)
+
         if candidates:
             hit_count = max(
                 tcam.observation_count(prefix, now)
                 for tcam in self.leaf_tcams.values()
             )
-            return self._maybe_install_leaf_rules(prefix, hit_count, now)
-        # No candidates — remove leaf rules from all leaves.
+            all_ops.extend(self._maybe_install_leaf_rules(prefix, hit_count, now))
+            return all_ops
+
+        # No candidates at all — remove from all leaves.
         self._leaf_locations.pop(prefix, None)
-        all_ops: list[SwitchOp] = []
         for ls, tcam in self.leaf_tcams.items():
             removed = tcam.remove(prefix)
             if removed is None:
