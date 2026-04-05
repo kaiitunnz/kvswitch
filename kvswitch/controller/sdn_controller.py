@@ -219,16 +219,16 @@ class SDNController:
         # Per-prefix ECMP group state (spine tier).
         self._next_group_id: int = 0
         self._prefix_group_ids: dict[tuple[int, ...], int] = {}
-        self._prefix_ecmp_bucket_maps: dict[str, dict[tuple[int, ...], dict[int, str]]] = (
-            defaultdict(dict)
-        )
+        self._prefix_ecmp_bucket_maps: dict[
+            str, dict[tuple[int, ...], dict[int, str]]
+        ] = defaultdict(dict)
 
         # Per-prefix ECMP group state (leaf tier).
         self._next_leaf_group_id: int = 0
         self._leaf_prefix_group_ids: dict[str, dict[PrefixKey, int]] = defaultdict(dict)
-        self._leaf_prefix_ecmp_bucket_maps: dict[str, dict[PrefixKey, dict[int, str]]] = (
-            defaultdict(dict)
-        )
+        self._leaf_prefix_ecmp_bucket_maps: dict[
+            str, dict[PrefixKey, dict[int, str]]
+        ] = defaultdict(dict)
 
         # Coalescing: instead of reconciling on every queue_update, we schedule
         # a single deferred refresh that absorbs all updates within the interval.
@@ -258,9 +258,7 @@ class SDNController:
                 for worker_id, state in self.worker_loads.items()
             },
             "spine_rules": self.spine_tcam.snapshot(),
-            "leaf_rules": {
-                ls: tcam.snapshot() for ls, tcam in self.leaf_tcams.items()
-            },
+            "leaf_rules": {ls: tcam.snapshot() for ls, tcam in self.leaf_tcams.items()},
             "spine_locations": {
                 format_prefix_key(prefix): sorted(workers)
                 for prefix, workers in self._spine_locations.items()
@@ -377,7 +375,6 @@ class SDNController:
     def _mac_int(mac: str) -> int:
         return int(mac.replace(":", ""), 16)
 
-
     def _leaf_switch_for_prefix(self, prefix: PrefixKey) -> str:
         candidates = self._leaf_locations.get(prefix)
         if not candidates:
@@ -450,29 +447,38 @@ class SDNController:
 
             # Install/update spine_prefix_route: h0 → group_id.
             if old_bucket_map is not None:
-                ops.append(TableDeleteOp(
-                    switch=sw, table="spine_prefix_route",
+                ops.append(
+                    TableDeleteOp(
+                        switch=sw,
+                        table="spine_prefix_route",
+                        match={"hdr.kvswitch.h0": f"0x{h0:08x}&&&0xffffffff"},
+                        priority=1,
+                    )
+                )
+            ops.append(
+                TableAddOp(
+                    switch=sw,
+                    table="spine_prefix_route",
+                    action="set_prefix_ecmp_group",
                     match={"hdr.kvswitch.h0": f"0x{h0:08x}&&&0xffffffff"},
+                    action_params={"group_id": group_id},
                     priority=1,
-                ))
-            ops.append(TableAddOp(
-                switch=sw, table="spine_prefix_route",
-                action="set_prefix_ecmp_group",
-                match={"hdr.kvswitch.h0": f"0x{h0:08x}&&&0xffffffff"},
-                action_params={"group_id": group_id},
-                priority=1,
-            ))
+                )
+            )
 
             # Clear old bucket entries for this group and install new ones.
             if old_bucket_map is not None:
                 for old_bucket in old_bucket_map:
-                    ops.append(TableDeleteOp(
-                        switch=sw, table="spine_prefix_ecmp",
-                        match={
-                            "meta.prefix_ecmp_group": group_id,
-                            "meta.ecmp_bucket": old_bucket,
-                        },
-                    ))
+                    ops.append(
+                        TableDeleteOp(
+                            switch=sw,
+                            table="spine_prefix_ecmp",
+                            match={
+                                "meta.prefix_ecmp_group": group_id,
+                                "meta.ecmp_bucket": old_bucket,
+                            },
+                        )
+                    )
             for bucket, leaf_switch in bucket_map.items():
                 # Find the port on this spine that reaches this leaf.
                 port = next(
@@ -480,15 +486,18 @@ class SDNController:
                     for w in self._workers.values()
                     if w.leaf_switch == leaf_switch
                 )
-                ops.append(TableAddOp(
-                    switch=sw, table="spine_prefix_ecmp",
-                    action="route_to_pod",
-                    match={
-                        "meta.prefix_ecmp_group": group_id,
-                        "meta.ecmp_bucket": bucket,
-                    },
-                    action_params={"port": port},
-                ))
+                ops.append(
+                    TableAddOp(
+                        switch=sw,
+                        table="spine_prefix_ecmp",
+                        action="route_to_pod",
+                        match={
+                            "meta.prefix_ecmp_group": group_id,
+                            "meta.ecmp_bucket": bucket,
+                        },
+                        action_params={"port": port},
+                    )
+                )
 
             self._adapter.apply_ops(ops)
             self._prefix_ecmp_bucket_maps[sw][prefix] = dict(bucket_map)
@@ -518,20 +527,26 @@ class SDNController:
         for sw in self._spine_switches:
             ops: list[SwitchOp] = []
             old_map = self._prefix_ecmp_bucket_maps[sw].pop(prefix, None)
-            ops.append(TableDeleteOp(
-                switch=sw, table="spine_prefix_route",
-                match={"hdr.kvswitch.h0": f"0x{h0:08x}&&&0xffffffff"},
-                priority=1,
-            ))
+            ops.append(
+                TableDeleteOp(
+                    switch=sw,
+                    table="spine_prefix_route",
+                    match={"hdr.kvswitch.h0": f"0x{h0:08x}&&&0xffffffff"},
+                    priority=1,
+                )
+            )
             if old_map:
                 for bucket in old_map:
-                    ops.append(TableDeleteOp(
-                        switch=sw, table="spine_prefix_ecmp",
-                        match={
-                            "meta.prefix_ecmp_group": group_id,
-                            "meta.ecmp_bucket": bucket,
-                        },
-                    ))
+                    ops.append(
+                        TableDeleteOp(
+                            switch=sw,
+                            table="spine_prefix_ecmp",
+                            match={
+                                "meta.prefix_ecmp_group": group_id,
+                                "meta.ecmp_bucket": bucket,
+                            },
+                        )
+                    )
             self._adapter.apply_ops(ops)
             all_ops.extend(ops)
         return all_ops
@@ -572,7 +587,8 @@ class SDNController:
 
             # Probe-fraction seeding: uncovered local workers get probe weight.
             all_local_workers = {
-                w_id for w_id, w in self._workers.items()
+                w_id
+                for w_id, w in self._workers.items()
                 if w.leaf_switch == leaf_switch
             }
             uncovered = all_local_workers - local_candidates
@@ -613,43 +629,56 @@ class SDNController:
 
             # Delete old route entry if exists.
             if old_bucket_map is not None:
-                ops.append(TableDeleteOp(
-                    switch=leaf_switch, table="leaf_prefix_route",
-                    match=match, priority=1,
-                ))
+                ops.append(
+                    TableDeleteOp(
+                        switch=leaf_switch,
+                        table="leaf_prefix_route",
+                        match=match,
+                        priority=1,
+                    )
+                )
             # Install route: prefix → group_id.
-            ops.append(TableAddOp(
-                switch=leaf_switch, table="leaf_prefix_route",
-                action="set_leaf_prefix_ecmp_group",
-                match=match,
-                action_params={"group_id": group_id},
-                priority=1,
-            ))
+            ops.append(
+                TableAddOp(
+                    switch=leaf_switch,
+                    table="leaf_prefix_route",
+                    action="set_leaf_prefix_ecmp_group",
+                    match=match,
+                    action_params={"group_id": group_id},
+                    priority=1,
+                )
+            )
 
             # Clear old bucket entries and install new ones.
             if old_bucket_map is not None:
                 for old_bucket in old_bucket_map:
-                    ops.append(TableDeleteOp(
-                        switch=leaf_switch, table="leaf_prefix_ecmp",
-                        match={
-                            "meta.leaf_prefix_ecmp_group": group_id,
-                            "meta.leaf_ecmp_bucket": old_bucket,
-                        },
-                    ))
+                    ops.append(
+                        TableDeleteOp(
+                            switch=leaf_switch,
+                            table="leaf_prefix_ecmp",
+                            match={
+                                "meta.leaf_prefix_ecmp_group": group_id,
+                                "meta.leaf_ecmp_bucket": old_bucket,
+                            },
+                        )
+                    )
             for bucket, worker_id in bucket_map.items():
                 worker = self._workers[worker_id]
-                ops.append(TableAddOp(
-                    switch=leaf_switch, table="leaf_prefix_ecmp",
-                    action="route_to_worker",
-                    match={
-                        "meta.leaf_prefix_ecmp_group": group_id,
-                        "meta.leaf_ecmp_bucket": bucket,
-                    },
-                    action_params={
-                        "port": worker.leaf_port,
-                        "dst_mac": self._mac_int(worker.worker_mac),
-                    },
-                ))
+                ops.append(
+                    TableAddOp(
+                        switch=leaf_switch,
+                        table="leaf_prefix_ecmp",
+                        action="route_to_worker",
+                        match={
+                            "meta.leaf_prefix_ecmp_group": group_id,
+                            "meta.leaf_ecmp_bucket": bucket,
+                        },
+                        action_params={
+                            "port": worker.leaf_port,
+                            "dst_mac": self._mac_int(worker.worker_mac),
+                        },
+                    )
+                )
 
             if evicted is not None:
                 all_ops.extend(
@@ -688,19 +717,26 @@ class SDNController:
             value = prefix[idx] if idx < len(prefix) else 0
             mask = 0xFFFFFFFF if idx < len(prefix) else 0
             match[field_name] = f"0x{value:08x}&&&0x{mask:08x}"
-        ops.append(TableDeleteOp(
-            switch=leaf_switch, table="leaf_prefix_route",
-            match=match, priority=1,
-        ))
+        ops.append(
+            TableDeleteOp(
+                switch=leaf_switch,
+                table="leaf_prefix_route",
+                match=match,
+                priority=1,
+            )
+        )
         if old_map:
             for bucket in old_map:
-                ops.append(TableDeleteOp(
-                    switch=leaf_switch, table="leaf_prefix_ecmp",
-                    match={
-                        "meta.leaf_prefix_ecmp_group": group_id,
-                        "meta.leaf_ecmp_bucket": bucket,
-                    },
-                ))
+                ops.append(
+                    TableDeleteOp(
+                        switch=leaf_switch,
+                        table="leaf_prefix_ecmp",
+                        match={
+                            "meta.leaf_prefix_ecmp_group": group_id,
+                            "meta.leaf_ecmp_bucket": bucket,
+                        },
+                    )
+                )
         self._adapter.apply_ops(ops)
         return ops
 
@@ -751,8 +787,7 @@ class SDNController:
 
         if candidates:
             hit_count = max(
-                tcam.observation_count(prefix, now)
-                for tcam in self.leaf_tcams.values()
+                tcam.observation_count(prefix, now) for tcam in self.leaf_tcams.values()
             )
             all_ops.extend(self._maybe_install_leaf_rules(prefix, hit_count, now))
             return all_ops
@@ -878,9 +913,7 @@ class SDNController:
             for placement in self._workers.values():
                 if placement.leaf_switch not in leaves:
                     leaves[placement.leaf_switch] = placement.spine_ports[sw]
-            ops: list[SwitchOp] = [
-                TableClearOp(switch=sw, table="spine_ecmp_select")
-            ]
+            ops: list[SwitchOp] = [TableClearOp(switch=sw, table="spine_ecmp_select")]
             for bucket, leaf_switch in bucket_map.items():
                 ops.append(
                     TableAddOp(

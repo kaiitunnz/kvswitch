@@ -442,7 +442,10 @@ def test_mock_worker_emits_cache_events_and_controller_tracks_prefixes() -> None
 
         expected_prefix = tuple(prefix_hashes)
         await _wait_until(
-            lambda: any(tcam.installed_rule(expected_prefix) is not None for tcam in controller.leaf_tcams.values()),
+            lambda: any(
+                tcam.installed_rule(expected_prefix) is not None
+                for tcam in controller.leaf_tcams.values()
+            ),
             timeout=2.0,
         )
 

@@ -14,11 +14,11 @@ import logging
 import shlex
 import statistics
 import sys
-from dataclasses import dataclass
 import threading
 import time
 from collections import defaultdict
 from collections.abc import Coroutine, Iterable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
@@ -69,6 +69,7 @@ PYTHON = sys.executable
 WORKER_PORT = 8000
 ROUTER_PORT = 9000
 CONTROLLER_PORT = 9100
+WARMUP_PER_GROUP = 20
 
 HEALTHCHECK_MODULE = "kvswitch.network.cli.healthcheck"
 WORKLOAD_CLIENT_MODULE = "kvswitch.network.cli.workload_client"
@@ -232,7 +233,8 @@ def _populate_ipv4_routes(net: Mininet, adapter: FinsyAdapter) -> None:
             link = cast(Link | None, intf.link)
             if link is None:
                 continue
-            other_intf = link.intf1 if link.intf2 == intf else link.intf2
+            other_intf: Intf | None = link.intf1 if link.intf2 == intf else link.intf2
+            assert other_intf is not None
             other_node = cast(Node, other_intf.node)
 
             if other_node in net.hosts:
@@ -242,7 +244,7 @@ def _populate_ipv4_routes(net: Mininet, adapter: FinsyAdapter) -> None:
                     installed_ips.add(ip)
                     ops.append(
                         TableAddOp(
-                            switch=sw.name,
+                            switch=sw.name,  # type: ignore
                             table="ipv4_lpm",
                             action="forward",
                             match={"hdr.ipv4.dstAddr": f"{ip}/32"},
@@ -261,7 +263,10 @@ def _populate_ipv4_routes(net: Mininet, adapter: FinsyAdapter) -> None:
                     n_link = cast(Link | None, n_intf.link)
                     if n_link is None:
                         continue
-                    n_peer = n_link.intf1 if n_link.intf2 == n_intf else n_link.intf2
+                    n_peer: Intf | None = (
+                        n_link.intf1 if n_link.intf2 == n_intf else n_link.intf2
+                    )
+                    assert n_peer is not None
                     n_node = cast(Node, n_peer.node)
                     if n_node not in net.hosts and n_node != sw:
                         hop2_switches.append(cast(Switch, n_node))
@@ -272,7 +277,10 @@ def _populate_ipv4_routes(net: Mininet, adapter: FinsyAdapter) -> None:
                         h_link = cast(Link | None, h_intf.link)
                         if h_link is None:
                             continue
-                        h_peer = h_link.intf1 if h_link.intf2 == h_intf else h_link.intf2
+                        h_peer: Intf | None = (
+                            h_link.intf1 if h_link.intf2 == h_intf else h_link.intf2
+                        )
+                        assert h_peer is not None
                         h_node = cast(Node, h_peer.node)
                         if h_node in net.hosts:
                             ip = h_node.IP()
@@ -280,7 +288,7 @@ def _populate_ipv4_routes(net: Mininet, adapter: FinsyAdapter) -> None:
                                 installed_ips.add(ip)
                                 ops.append(
                                     TableAddOp(
-                                        switch=sw.name,
+                                        switch=sw.name,  # type: ignore
                                         table="ipv4_lpm",
                                         action="forward",
                                         match={"hdr.ipv4.dstAddr": f"{ip}/32"},
@@ -591,7 +599,8 @@ def _find_port(sw: Node, target: Node) -> int:
         link = cast(Link | None, intf.link)
         if link is None:
             continue
-        other = link.intf1 if link.intf2 == intf else link.intf2
+        other: Intf | None = link.intf1 if link.intf2 == intf else link.intf2
+        assert other is not None
         if cast(Node, other.node) == target:
             return port_num
     raise RuntimeError(f"no link from {sw.name} to {target.name}")
@@ -653,13 +662,13 @@ def _program_uniform_ecmp(
     # --- Spine ECMP: distribute buckets across worker leaves ---
     leaf_names = sorted({p.leaf_switch for p in placements})
     for sp_name in spine_names:
-        ops: list[SwitchOp] = [
-            TableClearOp(switch=sp_name, table="spine_ecmp_select")
-        ]
+        ops: list[SwitchOp] = [TableClearOp(switch=sp_name, table="spine_ecmp_select")]
         for bucket in range(ECMP_BUCKETS):
             leaf_name = leaf_names[bucket % len(leaf_names)]
             # Find the spine port leading to this leaf.
-            port = next(p.spine_ports[sp_name] for p in placements if p.leaf_switch == leaf_name)
+            port = next(
+                p.spine_ports[sp_name] for p in placements if p.leaf_switch == leaf_name
+            )
             ops.append(
                 TableAddOp(
                     switch=sp_name,
@@ -728,9 +737,7 @@ def _program_ingress_ecmp(
     """Program ingress-leaf ECMP to distribute across spines."""
     ingress_switches = [sw for sw in net.switches if sw.name.startswith("ingress")]
     for ing in ingress_switches:
-        ops: list[SwitchOp] = [
-            TableClearOp(switch=ing.name, table="spine_ecmp_select")
-        ]
+        ops: list[SwitchOp] = [TableClearOp(switch=ing.name, table="spine_ecmp_select")]
         for bucket in range(ECMP_BUCKETS):
             sp_name = spine_names[bucket % len(spine_names)]
             sp_port = _find_port(ing, _get_node(net, sp_name))
@@ -758,6 +765,8 @@ def run_baseline_l4_rr(
     adapter: FinsyAdapter,
     base_ttft_ms: float | None = None,
     per_token_ttft_ms: float | None = None,
+    max_num_seqs: int = 256,
+    max_num_batched_tokens: int = 8192,
 ) -> list[RequestMetric]:
     """L4 Round-Robin: uniform ECMP distributes traffic via KVSwitch VIP."""
     logger.info("--- Baseline: L4 Round-Robin ---")
@@ -775,12 +784,16 @@ def run_baseline_l4_rr(
         base_ttft_ms=base_ttft_ms,
         per_token_ttft_ms=per_token_ttft_ms,
         ttft_ms=ttft_ms,
+        max_num_seqs=max_num_seqs,
+        max_num_batched_tokens=max_num_batched_tokens,
     )
 
     client = _get_node(net, "client")
 
     # Warm up worker caches so the timed run reflects steady-state.
-    warmup_workload = _build_warmup_workload(workload_path)
+    warmup_workload = _build_warmup_workload(
+        workload_path, n_per_group=WARMUP_PER_GROUP
+    )
     if warmup_workload:
         warmup_path = "/tmp/eval_warmup.json"
         with open(warmup_path, "w") as f:
@@ -819,6 +832,8 @@ def run_baseline_l7(
     client_timeout: float,
     base_ttft_ms: float | None = None,
     per_token_ttft_ms: float | None = None,
+    max_num_seqs: int = 256,
+    max_num_batched_tokens: int = 8192,
 ) -> list[RequestMetric]:
     """L7 Prefix-Aware: Client → L7 proxy → best worker."""
     logger.info("--- Baseline: L7 Prefix-Aware Router ---")
@@ -831,6 +846,8 @@ def run_baseline_l7(
         base_ttft_ms=base_ttft_ms,
         per_token_ttft_ms=per_token_ttft_ms,
         ttft_ms=ttft_ms,
+        max_num_seqs=max_num_seqs,
+        max_num_batched_tokens=max_num_batched_tokens,
     )
 
     # Start L7 proxy on the router host.
@@ -857,7 +874,9 @@ def run_baseline_l7(
         raise
 
     # Warm up worker caches and router prefix table.
-    warmup_workload = _build_warmup_workload(workload_path)
+    warmup_workload = _build_warmup_workload(
+        workload_path, n_per_group=WARMUP_PER_GROUP
+    )
     if warmup_workload:
         warmup_path = "/tmp/eval_warmup.json"
         with open(warmup_path, "w") as f:
@@ -908,6 +927,7 @@ def _build_warmup_workload(workload_path: str, n_per_group: int = 2) -> list[dic
                 **req,
                 "request_id": 90000 + len(warmup),
                 "scheduled_time": 0.0,
+                "max_tokens": 1,
             }
         )
     return warmup
@@ -926,6 +946,8 @@ def run_baseline_kvswitch(
     base_ttft_ms: float | None = None,
     per_token_ttft_ms: float | None = None,
     admission_threshold: int = 2,
+    max_num_seqs: int = 256,
+    max_num_batched_tokens: int = 8192,
 ) -> list[RequestMetric]:
     """KVSwitch: SDN controller populates TCAM; switches route shim-header traffic."""
     logger.info("--- Baseline: KVSwitch ---")
@@ -967,12 +989,14 @@ def run_baseline_kvswitch(
             base_ttft_ms=base_ttft_ms,
             per_token_ttft_ms=per_token_ttft_ms,
             ttft_ms=ttft_ms,
+            max_num_seqs=max_num_seqs,
+            max_num_batched_tokens=max_num_batched_tokens,
         )
 
         # Warm-up: send requests to populate both TCAM prefix rules and worker
         # caches.  Workers stay running so switch and cache state are consistent.
         warmup_workload = _build_warmup_workload(
-            workload_path, n_per_group=max(admission_threshold, 20)
+            workload_path, n_per_group=WARMUP_PER_GROUP
         )
         if warmup_workload:
             warmup_path = "/tmp/eval_warmup.json"
@@ -1041,7 +1065,7 @@ def main() -> None:
     parser.add_argument("--num-requests", type=int, default=200)
     parser.add_argument("--request-rate", type=float, default=10.0)
     parser.add_argument("--prefix-sharing-ratio", type=float, default=0.5)
-    parser.add_argument("--num-prefix-groups", type=int, default=3)
+    parser.add_argument("--num-prefix-groups", type=int, default=16)
     parser.add_argument("--system-prompt-tokens", type=int, default=256)
     parser.add_argument("--max-output-tokens", type=int, default=16)
     parser.add_argument(
@@ -1091,6 +1115,8 @@ def main() -> None:
         help="Drop KVSwitch requests whose UDP payload exceeds this size in bytes",
     )
     parser.add_argument("--admission-threshold", type=int, default=2)
+    parser.add_argument("--max-num-seqs", type=int, default=256)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=8192)
     parser.add_argument("--output-dir", type=str, default="results/eval")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log-level", type=str, default="INFO")
@@ -1262,6 +1288,8 @@ def main() -> None:
                     adapter=finsy_adapter,
                     base_ttft_ms=base_ttft_ms,
                     per_token_ttft_ms=per_token_ttft_ms,
+                    max_num_seqs=args.max_num_seqs,
+                    max_num_batched_tokens=args.max_num_batched_tokens,
                 )
             elif baseline == "l7":
                 metrics = run_baseline_l7(
@@ -1275,6 +1303,8 @@ def main() -> None:
                     args.client_timeout,
                     base_ttft_ms=base_ttft_ms,
                     per_token_ttft_ms=per_token_ttft_ms,
+                    max_num_seqs=args.max_num_seqs,
+                    max_num_batched_tokens=args.max_num_batched_tokens,
                 )
             elif baseline == "kvswitch":
                 metrics = run_baseline_kvswitch(
@@ -1290,6 +1320,8 @@ def main() -> None:
                     base_ttft_ms=base_ttft_ms,
                     per_token_ttft_ms=per_token_ttft_ms,
                     admission_threshold=args.admission_threshold,
+                    max_num_seqs=args.max_num_seqs,
+                    max_num_batched_tokens=args.max_num_batched_tokens,
                 )
             else:
                 continue

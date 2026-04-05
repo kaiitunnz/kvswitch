@@ -48,7 +48,7 @@ ignore_missing_imports = true
 files = ["kvswitch"]
 
 [tool.codespell]
-ignore-words-list = ["assertIn", "inout"]
+ignore-words-list = ["assertIn", "inout", "Clos", "clos"]
 skip = ["3rdparty", ".venv", "data", "results", "*.ipynb", "tmp"]
 
 [tool.pyright]
