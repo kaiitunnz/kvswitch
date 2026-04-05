@@ -57,6 +57,24 @@ control KVSwitchIngress(
         );
     }
 
+    // Independent leaf-tier hash using crc32 so leaf ECMP decisions are
+    // decorrelated from spine-tier bucket assignments.
+    action compute_leaf_ecmp_bucket() {
+        hash(
+            meta.leaf_ecmp_bucket,
+            HashAlgorithm.crc32,
+            (bit<16>)0,
+            {
+                hdr.ipv4.srcAddr,
+                hdr.ipv4.dstAddr,
+                hdr.udp.srcPort,
+                hdr.udp.dstPort,
+                hdr.kvswitch.req_id
+            },
+            ECMP_BUCKET_COUNT
+        );
+    }
+
     // Basic IPv4 forwarding for non-KVSwitch traffic (ARP, ping, etc.).
     table ipv4_lpm {
         key = {
@@ -119,7 +137,7 @@ control KVSwitchIngress(
     table leaf_prefix_ecmp {
         key = {
             meta.leaf_prefix_ecmp_group: exact;
-            meta.ecmp_bucket: exact;
+            meta.leaf_ecmp_bucket: exact;
         }
         actions = {
             route_to_worker;
@@ -144,7 +162,7 @@ control KVSwitchIngress(
 
     table leaf_ecmp_select {
         key = {
-            meta.ecmp_bucket: exact;
+            meta.leaf_ecmp_bucket: exact;
         }
         actions = {
             route_to_worker;
@@ -156,8 +174,10 @@ control KVSwitchIngress(
 
     apply {
         if (hdr.kvswitch.isValid()) {
-            // Compute ECMP bucket up front — needed by all ECMP paths.
+            // Compute both ECMP buckets up front — spine and leaf use
+            // independent hashes to decorrelate tier decisions.
             compute_ecmp_bucket();
+            compute_leaf_ecmp_bucket();
 
             if (leaf_prefix_route.apply().hit) {
                 // Per-prefix leaf ECMP across local cached workers.

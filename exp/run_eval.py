@@ -675,23 +675,17 @@ def _program_uniform_ecmp(
     workers_by_leaf: dict[str, list[WorkerPlacement]] = defaultdict(list)
     for p in placements:
         workers_by_leaf[p.leaf_switch].append(p)
-    n_leaves = len(workers_by_leaf)
     for leaf_name, leaf_workers in sorted(workers_by_leaf.items()):
         ops = [TableClearOp(switch=leaf_name, table="leaf_ecmp_select")]
         n_local = len(leaf_workers)
         for bucket in range(ECMP_BUCKETS):
-            # Use bucket // n_leaves for worker selection so the leaf-level
-            # decision is decorrelated from the spine-level decision (which
-            # uses bucket % n_leaves).  The P4 hash is identical at every
-            # hop, so using the same bucket modulus would always select the
-            # same worker-index on every leaf.
-            w = leaf_workers[(bucket // n_leaves) % n_local]
+            w = leaf_workers[bucket % n_local]
             ops.append(
                 TableAddOp(
                     switch=leaf_name,
                     table="leaf_ecmp_select",
                     action="route_to_worker",
-                    match={"meta.ecmp_bucket": bucket},
+                    match={"meta.leaf_ecmp_bucket": bucket},
                     action_params={
                         "port": w.leaf_port,
                         "dst_mac": int(w.worker_mac.replace(":", ""), 16),

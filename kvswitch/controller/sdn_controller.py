@@ -633,7 +633,7 @@ class SDNController:
                         switch=leaf_switch, table="leaf_prefix_ecmp",
                         match={
                             "meta.leaf_prefix_ecmp_group": group_id,
-                            "meta.ecmp_bucket": old_bucket,
+                            "meta.leaf_ecmp_bucket": old_bucket,
                         },
                     ))
             for bucket, worker_id in bucket_map.items():
@@ -643,7 +643,7 @@ class SDNController:
                     action="route_to_worker",
                     match={
                         "meta.leaf_prefix_ecmp_group": group_id,
-                        "meta.ecmp_bucket": bucket,
+                        "meta.leaf_ecmp_bucket": bucket,
                     },
                     action_params={
                         "port": worker.leaf_port,
@@ -698,7 +698,7 @@ class SDNController:
                     switch=leaf_switch, table="leaf_prefix_ecmp",
                     match={
                         "meta.leaf_prefix_ecmp_group": group_id,
-                        "meta.ecmp_bucket": bucket,
+                        "meta.leaf_ecmp_bucket": bucket,
                     },
                 ))
         self._adapter.apply_ops(ops)
@@ -919,7 +919,7 @@ class SDNController:
                         switch=leaf_switch,
                         table="leaf_ecmp_select",
                         action="route_to_worker",
-                        match={"meta.ecmp_bucket": bucket},
+                        match={"meta.leaf_ecmp_bucket": bucket},
                         action_params={
                             "port": worker.leaf_port,
                             "dst_mac": self._mac_int(worker.worker_mac),

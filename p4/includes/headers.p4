@@ -52,6 +52,7 @@ struct headers_t {
 
 struct metadata_t {
     bit<16> ecmp_bucket;
+    bit<16> leaf_ecmp_bucket;
     bit<16> prefix_ecmp_group;
     bit<16> leaf_prefix_ecmp_group;
 }
