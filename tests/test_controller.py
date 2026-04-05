@@ -846,3 +846,77 @@ def test_oob_controller_receives_events_on_alternate_bind_address() -> None:
         controller.close()
 
     asyncio.run(_run())
+
+
+def test_multi_spine_prefix_rule_replicated_to_all_spines() -> None:
+    """Prefix rules are installed on every spine switch."""
+    adapter = InMemorySwitchAdapter()
+    controller = SDNController(
+        workers=[
+            WorkerPlacement(
+                worker_id="worker0",
+                leaf_switch="leaf0",
+                worker_ip="10.2.0.1",
+                worker_mac="02:00:00:00:00:01",
+                leaf_port=3,
+                spine_ports={"spine0": 2, "spine1": 2},
+            ),
+        ],
+        admission_threshold=1,
+        adapter=adapter,
+        spine_switches=["spine0", "spine1"],
+    )
+
+    prefix = (0x1, 0x2, 0x3)
+    controller.handle_event(
+        CacheSyncEvent("alloc", "worker0", prefix_hashes=prefix, timestamp=1.0)
+    )
+
+    # Both spines should have the prefix rule.
+    spine0_adds = adapter.table_adds(switch="spine0", table="spine_prefix_route")
+    spine1_adds = adapter.table_adds(switch="spine1", table="spine_prefix_route")
+    assert len(spine0_adds) == 1
+    assert len(spine1_adds) == 1
+    assert spine0_adds[0].action_params["port"] == 2
+    assert spine1_adds[0].action_params["port"] == 2
+
+
+def test_multi_spine_ecmp_programmed_per_spine() -> None:
+    """Each spine gets its own ECMP table with correct per-spine port mappings."""
+    adapter = InMemorySwitchAdapter()
+    controller = SDNController(
+        workers=[
+            WorkerPlacement(
+                worker_id="worker0",
+                leaf_switch="leaf0",
+                worker_ip="10.2.0.1",
+                worker_mac="02:00:00:00:00:01",
+                leaf_port=3,
+                spine_ports={"spine0": 2, "spine1": 3},
+            ),
+            WorkerPlacement(
+                worker_id="worker1",
+                leaf_switch="leaf1",
+                worker_ip="10.2.1.1",
+                worker_mac="02:00:00:00:00:02",
+                leaf_port=3,
+                spine_ports={"spine0": 4, "spine1": 5},
+            ),
+        ],
+        adapter=adapter,
+        spine_switches=["spine0", "spine1"],
+    )
+
+    controller._refresh_ecmp_weights()
+
+    # Each spine should have ECMP entries.
+    s0_adds = adapter.table_adds(switch="spine0", table="spine_ecmp_select")
+    s1_adds = adapter.table_adds(switch="spine1", table="spine_ecmp_select")
+    assert len(s0_adds) > 0
+    assert len(s1_adds) > 0
+
+    # Port numbers should differ between spines.
+    s0_ports = {op.action_params["port"] for op in s0_adds}
+    s1_ports = {op.action_params["port"] for op in s1_adds}
+    assert s0_ports == {2, 4}
+    assert s1_ports == {3, 5}
