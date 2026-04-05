@@ -37,6 +37,10 @@ control KVSwitchIngress(
         meta.prefix_ecmp_group = group_id;
     }
 
+    action set_leaf_prefix_ecmp_group(bit<16> group_id) {
+        meta.leaf_prefix_ecmp_group = group_id;
+    }
+
     action compute_ecmp_bucket() {
         hash(
             meta.ecmp_bucket,
@@ -95,6 +99,7 @@ control KVSwitchIngress(
         default_action = drop();
     }
 
+    // Leaf prefix match: maps (h0, h1, h2) to a per-prefix leaf ECMP group.
     table leaf_prefix_route {
         key = {
             hdr.kvswitch.h0: ternary;
@@ -102,11 +107,26 @@ control KVSwitchIngress(
             hdr.kvswitch.h2: ternary;
         }
         actions = {
-            route_to_worker;
+            set_leaf_prefix_ecmp_group;
             NoAction;
         }
         size = 1024;
         default_action = NoAction();
+    }
+
+    // Per-prefix leaf ECMP: distributes prefix-matched traffic across
+    // local workers weighted by cache locality and load.
+    table leaf_prefix_ecmp {
+        key = {
+            meta.leaf_prefix_ecmp_group: exact;
+            meta.ecmp_bucket: exact;
+        }
+        actions = {
+            route_to_worker;
+            drop;
+        }
+        size = 4096;
+        default_action = drop();
     }
 
     // Miss-path ECMP: distributes non-prefix-matched traffic.
@@ -136,22 +156,22 @@ control KVSwitchIngress(
 
     apply {
         if (hdr.kvswitch.isValid()) {
-            // KVSwitch shim header present — use prefix-aware routing.
-            if (!leaf_prefix_route.apply().hit) {
-                // Compute ECMP bucket for both prefix and miss paths.
-                compute_ecmp_bucket();
-                if (spine_prefix_route.apply().hit) {
-                    // Per-prefix weighted ECMP across cached leaves.
-                    spine_prefix_ecmp.apply();
-                } else {
-                    // Miss path: fall back to load-balanced ECMP.
-                    if (!leaf_ecmp_select.apply().hit) {
-                        spine_ecmp_select.apply();
-                    }
+            // Compute ECMP bucket up front — needed by all ECMP paths.
+            compute_ecmp_bucket();
+
+            if (leaf_prefix_route.apply().hit) {
+                // Per-prefix leaf ECMP across local cached workers.
+                leaf_prefix_ecmp.apply();
+            } else if (spine_prefix_route.apply().hit) {
+                // Per-prefix spine ECMP across cached leaves.
+                spine_prefix_ecmp.apply();
+            } else {
+                // Miss path: load-balanced ECMP fallback.
+                if (!leaf_ecmp_select.apply().hit) {
+                    spine_ecmp_select.apply();
                 }
             }
         } else if (hdr.ipv4.isValid()) {
-            // Regular IPv4 traffic — basic LPM forwarding.
             ipv4_lpm.apply();
         }
     }
