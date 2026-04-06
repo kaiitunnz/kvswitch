@@ -78,7 +78,7 @@ class TestWorkloadConfig:
         assert cfg.request_rate == 10.0
         assert cfg.prefix_sharing_ratio == 0.5
         assert cfg.num_prefix_groups == 3
-        assert cfg.max_output_tokens == 16
+        assert cfg.max_output_tokens == 256
 
     def test_custom(self) -> None:
         cfg = WorkloadConfig(num_requests=50, request_rate=5.0)

@@ -32,6 +32,7 @@ class WorkloadRequest:
     prefix_group: str  # "group_0" … "group_N" or "none"
     max_tokens: int
     prefix_hashes: list[int] | None = None  # truncated 32-bit hashes for shim header
+    prompt: str | None = None  # raw text; carried so L7 proxy can simulate tokenization
 
 
 @dataclass
@@ -143,7 +144,7 @@ class WorkloadGenerator:
         logger.info("Loaded %d raw prompts from ShareGPT", len(raw_pairs))
 
         tokenizer = self._get_tokenizer()
-        tokenized: list[tuple[list[int], int]] = []
+        tokenized: list[tuple[str, list[int], int]] = []
         for human_text, gpt_reply in raw_pairs:
             prompt_ids = tokenizer.encode(human_text)
             if not prompt_ids:
@@ -157,7 +158,7 @@ class WorkloadGenerator:
             else:
                 output_tokens = cfg.max_output_tokens
             output_tokens = max(output_tokens, 1)
-            tokenized.append((prompt_ids, output_tokens))
+            tokenized.append((human_text, prompt_ids, output_tokens))
             if len(tokenized) >= cfg.num_requests:
                 break
 
@@ -175,21 +176,29 @@ class WorkloadGenerator:
             cfg.num_prefix_groups, cfg.system_prompt_tokens, cfg.seed
         )
 
+        # Decode each group's token IDs to text once so the prompt field
+        # carries the full-length string (system prefix + human text).
+        system_prompt_texts: dict[str, str] = {
+            group: tokenizer.decode(ids) for group, ids in system_prompts.items()
+        }
+
         # Assign prefix groups and build final token sequences.
         group_keys = list(system_prompts.keys())
         requests: list[WorkloadRequest] = []
         t = 0.0
 
         for i in range(cfg.num_requests):
-            user_tokens, output_tokens = tokenized[i]
+            human_text, user_tokens, output_tokens = tokenized[i]
 
             # Assign to a prefix group with probability prefix_sharing_ratio.
             if rng.random() < cfg.prefix_sharing_ratio:
                 group = rng.choice(group_keys)
                 prompt_ids = system_prompts[group] + user_tokens
+                prompt = system_prompt_texts[group] + " " + human_text
             else:
                 group = "none"
                 prompt_ids = user_tokens
+                prompt = human_text
 
             # Truncate to max_prompt_tokens.
             prompt_ids = prompt_ids[: cfg.max_prompt_tokens]
@@ -213,6 +222,7 @@ class WorkloadGenerator:
                     prefix_group=group,
                     max_tokens=output_tokens,
                     prefix_hashes=prefix_hashes,
+                    prompt=prompt,
                 )
             )
 
@@ -254,6 +264,7 @@ def load_workload(path: Path) -> list[WorkloadRequest]:
                 if r.get("prefix_hashes") is not None
                 else None
             ),
+            prompt=r.get("prompt"),
         )
         for r in data
     ]

@@ -20,6 +20,9 @@ class _DummyTokenizer:
             return list(range(10))
         return list(range(255))
 
+    def decode(self, ids: list[int]) -> str:
+        return f"decoded_{len(ids)}_tokens"
+
 
 class TestWorkloadSerialization:
     def test_save_and_load_preserve_prefix_hashes(self, tmp_path: Path) -> None:

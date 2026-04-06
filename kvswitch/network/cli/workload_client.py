@@ -63,6 +63,8 @@ async def _send_one(
         "prompt_token_ids": request["prompt_token_ids"],
         "max_tokens": request.get("max_tokens", 16),
     }
+    if not kvswitch and request.get("prompt") is not None:
+        payload["prompt"] = request["prompt"]
     if not kvswitch and "prefix_hashes" in request:
         payload["prefix_hashes"] = request["prefix_hashes"]
 
