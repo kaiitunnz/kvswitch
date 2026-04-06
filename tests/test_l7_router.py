@@ -199,3 +199,36 @@ class TestRouteText:
         assert result.hash_ms >= 0.0
         assert result.lookup_ms >= 0.0
         assert result.total_ms >= result.tokenize_ms
+
+    def test_route_with_override_token_ids_uses_provided_ids(self) -> None:
+        """When token_ids are provided, route() uses them for hashing/routing
+        instead of the tokenization result, while still paying tokenize cost."""
+        router = _make_router(n_workers=2)
+        # Use specific token IDs that produce known block hashes.
+        override_ids = list(range(32))
+        hashes = router.hash_blocks(override_ids)
+        router.update_cache(1, hashes)
+
+        # Route with a prompt whose tokenization differs from override_ids.
+        result = router.route("Hello, world!", token_ids=override_ids)
+        assert result.worker_idx == 1
+        assert result.matched_blocks == 2
+        assert result.tokenize_ms > 0.0  # tokenization still happened
+
+    def test_route_with_override_tokenize_cost_included(self) -> None:
+        """route(prompt, token_ids) includes tokenize_ms in total_ms."""
+        router = _make_router()
+        result = router.route("A " * 200, token_ids=list(range(32)))
+        assert result.tokenize_ms > 0.0
+        assert result.total_ms >= result.tokenize_ms
+
+    def test_route_without_override_uses_tokenized(self) -> None:
+        """Without token_ids, route() uses the tokenized prompt for routing."""
+        router = _make_router(n_workers=2)
+        prompt = "Hello, world! This is a test prompt with enough tokens."
+        # Route twice — should produce identical routing decisions.
+        r1 = router.route(prompt)
+        # Reset round-robin counter by clearing cache context.
+        r2 = router.route(prompt)
+        assert r1.total_blocks == r2.total_blocks
+        assert r1.block_hashes == r2.block_hashes

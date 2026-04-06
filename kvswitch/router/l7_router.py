@@ -80,14 +80,19 @@ class L7Router:
     # Routing
     # ------------------------------------------------------------------
 
-    def route(self, prompt: str) -> RoutingResult:
+    def route(self, prompt: str, token_ids: list[int] | None = None) -> RoutingResult:
         """Full L7 routing pipeline with per-step timing."""
         t_total = time.perf_counter()
 
         # Step 1 — Tokenize.
         t0 = time.perf_counter()
-        token_ids = self.tokenizer.encode(prompt)
+        tokenized = self.tokenizer.encode(prompt)
         tokenize_ms = (time.perf_counter() - t0) * 1000
+
+        # If token_ids are provided, use them directly (bypassing tokenization);
+        # otherwise, use the tokenized result from the prompt.
+        if token_ids is None:
+            token_ids = tokenized
 
         # Step 2 — Hash blocks.
         t0 = time.perf_counter()
