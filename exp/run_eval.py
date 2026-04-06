@@ -557,8 +557,8 @@ def _start_workers(
     base_ttft_ms: float | None = None,
     per_token_ttft_ms: float | None = None,
     ttft_ms: float = 10.0,
-    load_update_interval_ms: float = 500.0,
-    load_update_delta: int = 500,
+    load_update_interval_ms: float = 100.0,
+    load_update_delta: int = 100,
     max_num_batched_tokens: int = 8192,
     max_num_seqs: int = 256,
 ) -> None:
@@ -754,7 +754,7 @@ def _program_ingress_ecmp(
     logger.info("Programmed ingress ECMP across %d spines", len(spine_names))
 
 
-def run_baseline_l4_rr(
+def run_baseline_l4_ecmp(
     net: Mininet,
     topo: TopoConfig,
     ttft_ms: float,
@@ -819,10 +819,10 @@ def run_baseline_l4_rr(
     )
 
     _stop_workers(net, topo.n_workers)
-    return _to_request_metrics(raw, "l4_rr")
+    return _to_request_metrics(raw, "l4_ecmp")
 
 
-def run_baseline_l7(
+def _run_l7_baseline(
     net: Mininet,
     topo: TopoConfig,
     ttft_ms: float,
@@ -831,14 +831,16 @@ def run_baseline_l7(
     workload_path: str,
     model: str,
     client_timeout: float,
+    baseline_name: str,
+    round_robin: bool = False,
     base_ttft_ms: float | None = None,
     per_token_ttft_ms: float | None = None,
     max_num_seqs: int = 256,
     max_num_batched_tokens: int = 8192,
     warmup_per_group: int = DEFAULT_WARMUP_PER_GROUP,
 ) -> list[RequestMetric]:
-    """L7 Prefix-Aware: Client → L7 proxy → best worker."""
-    logger.info("--- Baseline: L7 Prefix-Aware Router ---")
+    mode = "Round-Robin" if round_robin else "Prefix-Aware"
+    logger.info("--- Baseline: L7 %s Router ---", mode)
     _start_workers(
         net,
         topo.n_workers,
@@ -856,16 +858,17 @@ def run_baseline_l7(
     router_host = _get_node(net, "router")
     workers_arg = ",".join(f"{p.worker_ip}:{WORKER_PORT}" for p in topo.placements)
     proxy_log = "/tmp/l7_proxy.log"
-    _start_bg(
-        router_host,
+    proxy_cmd = (
         "HF_HOME=/root/.cache/huggingface "
         "TRANSFORMERS_OFFLINE=1 "
         "HF_HUB_OFFLINE=1 "
         f"{PYTHON} -m kvswitch.router.l7_proxy"
         f" --model {model} --port {ROUTER_PORT}"
         f" --workers {workers_arg}"
-        f" > {proxy_log} 2>&1",
     )
+    if round_robin:
+        proxy_cmd += " --round-robin"
+    _start_bg(router_host, f"{proxy_cmd} > {proxy_log} 2>&1")
 
     client = _get_node(net, "client")
     try:
@@ -875,7 +878,7 @@ def run_baseline_l7(
         logger.error("L7 proxy log:\n%s", log_out)
         raise
 
-    # Warm up worker caches and router prefix table.
+    # Warm up worker caches.
     warmup_workload = _build_warmup_workload(
         workload_path, n_per_group=warmup_per_group
     )
@@ -883,7 +886,7 @@ def run_baseline_l7(
         warmup_path = "/tmp/eval_warmup.json"
         with open(warmup_path, "w") as f:
             json.dump(warmup_workload, f)
-        logger.info("L7 warm-up: %d requests", len(warmup_workload))
+        logger.info("L7 %s warm-up: %d requests", mode, len(warmup_workload))
         _collect_results(
             client,
             warmup_path,
@@ -898,7 +901,77 @@ def run_baseline_l7(
 
     _kill_bg(router_host)
     _stop_workers(net, topo.n_workers)
-    return _to_request_metrics(raw, "l7")
+    return _to_request_metrics(raw, baseline_name)
+
+
+def run_baseline_l7_rr(
+    net: Mininet,
+    topo: TopoConfig,
+    ttft_ms: float,
+    tpot_ms: float,
+    max_output_tokens: int,
+    workload_path: str,
+    model: str,
+    client_timeout: float,
+    base_ttft_ms: float | None = None,
+    per_token_ttft_ms: float | None = None,
+    max_num_seqs: int = 256,
+    max_num_batched_tokens: int = 8192,
+    warmup_per_group: int = DEFAULT_WARMUP_PER_GROUP,
+) -> list[RequestMetric]:
+    """L7 Round-Robin: Client → L7 proxy (round-robin) → worker."""
+    return _run_l7_baseline(
+        net,
+        topo,
+        ttft_ms,
+        tpot_ms,
+        max_output_tokens,
+        workload_path,
+        model,
+        client_timeout,
+        baseline_name="l7_rr",
+        round_robin=True,
+        base_ttft_ms=base_ttft_ms,
+        per_token_ttft_ms=per_token_ttft_ms,
+        max_num_seqs=max_num_seqs,
+        max_num_batched_tokens=max_num_batched_tokens,
+        warmup_per_group=warmup_per_group,
+    )
+
+
+def run_baseline_l7_pa(
+    net: Mininet,
+    topo: TopoConfig,
+    ttft_ms: float,
+    tpot_ms: float,
+    max_output_tokens: int,
+    workload_path: str,
+    model: str,
+    client_timeout: float,
+    base_ttft_ms: float | None = None,
+    per_token_ttft_ms: float | None = None,
+    max_num_seqs: int = 256,
+    max_num_batched_tokens: int = 8192,
+    warmup_per_group: int = DEFAULT_WARMUP_PER_GROUP,
+) -> list[RequestMetric]:
+    """L7 Prefix-Aware: Client → L7 proxy (prefix-aware) → best worker."""
+    return _run_l7_baseline(
+        net,
+        topo,
+        ttft_ms,
+        tpot_ms,
+        max_output_tokens,
+        workload_path,
+        model,
+        client_timeout,
+        baseline_name="l7_pa",
+        round_robin=False,
+        base_ttft_ms=base_ttft_ms,
+        per_token_ttft_ms=per_token_ttft_ms,
+        max_num_seqs=max_num_seqs,
+        max_num_batched_tokens=max_num_batched_tokens,
+        warmup_per_group=warmup_per_group,
+    )
 
 
 def _build_warmup_workload(workload_path: str, n_per_group: int = 2) -> list[dict]:
@@ -952,6 +1025,9 @@ def run_baseline_kvswitch(
     max_num_batched_tokens: int = 8192,
     per_prefix_ecmp: bool = True,
     warmup_per_group: int = DEFAULT_WARMUP_PER_GROUP,
+    coalesce_interval_s: float = 0.5,
+    load_update_interval_ms: float = 100.0,
+    load_update_delta: int = 100,
 ) -> list[RequestMetric]:
     """KVSwitch: SDN controller populates TCAM; switches route shim-header traffic."""
     logger.info("--- Baseline: KVSwitch ---")
@@ -965,7 +1041,7 @@ def run_baseline_kvswitch(
             port=CONTROLLER_PORT,
             adapter=adapter,
             spine_switches=topo.spine_names,
-            coalesce_interval_s=2.0,
+            coalesce_interval_s=coalesce_interval_s,
             admission_threshold=admission_threshold,
             per_prefix_ecmp=per_prefix_ecmp,
         )
@@ -996,6 +1072,8 @@ def run_baseline_kvswitch(
             ttft_ms=ttft_ms,
             max_num_seqs=max_num_seqs,
             max_num_batched_tokens=max_num_batched_tokens,
+            load_update_interval_ms=load_update_interval_ms,
+            load_update_delta=load_update_delta,
         )
 
         # Warm-up: send requests to populate both TCAM prefix rules and worker
@@ -1048,8 +1126,9 @@ def run_baseline_kvswitch(
 
 
 BASELINE_REGISTRY = {
-    "l4_rr": {"needs_router": False},
-    "l7": {"needs_router": True},
+    "l4_ecmp": {"needs_router": False},
+    "l7_rr": {"needs_router": True},
+    "l7_pa": {"needs_router": True},
     "kvswitch": {"needs_router": False},
 }
 
@@ -1061,15 +1140,15 @@ def main() -> None:
     parser.add_argument(
         "--baselines",
         type=str,
-        default="l4_rr,l7,kvswitch",
-        help="Comma-separated baselines: l4_rr, l7, kvswitch",
+        default="l4_ecmp,l7_rr,l7_pa,kvswitch",
+        help="Comma-separated baselines: l4_ecmp, l7_rr, l7_pa, kvswitch",
     )
     parser.add_argument("--n-spines", type=int, default=2)
     parser.add_argument("--n-worker-leaves", type=int, default=2)
     parser.add_argument("--workers-per-leaf", type=int, default=4)
     parser.add_argument("--num-requests", type=int, default=200)
     parser.add_argument("--request-rate", type=float, default=10.0)
-    parser.add_argument("--prefix-sharing-ratio", type=float, default=0.5)
+    parser.add_argument("--prefix-sharing-ratio", type=float, default=0.8)
     parser.add_argument("--num-prefix-groups", type=int, default=16)
     parser.add_argument("--system-prompt-tokens", type=int, default=512)
     parser.add_argument("--max-output-tokens", type=int, default=256)
@@ -1090,7 +1169,7 @@ def main() -> None:
         help="Path to the BMv2 JSON file or compile_p4.sh output directory",
     )
     parser.add_argument("--model", type=str, default="meta-llama/Llama-3.2-3B-Instruct")
-    parser.add_argument("--delay", type=str, default=None)
+    parser.add_argument("--delay", type=str, default="0.5ms")
     parser.add_argument(
         "--ttft-ms",
         type=float,
@@ -1122,6 +1201,9 @@ def main() -> None:
     parser.add_argument("--admission-threshold", type=int, default=2)
     parser.add_argument("--max-num-seqs", type=int, default=256)
     parser.add_argument("--max-num-batched-tokens", type=int, default=8192)
+    parser.add_argument("--coalesce-interval-s", type=float, default=0.5)
+    parser.add_argument("--load-update-interval-ms", type=float, default=100.0)
+    parser.add_argument("--load-update-delta", type=int, default=100)
     parser.add_argument(
         "--per-prefix-ecmp",
         action=argparse.BooleanOptionalAction,
@@ -1293,8 +1375,8 @@ def main() -> None:
     all_results: dict[str, list[RequestMetric]] = {}
     for baseline in baselines:
         try:
-            if baseline == "l4_rr":
-                metrics = run_baseline_l4_rr(
+            if baseline == "l4_ecmp":
+                metrics = run_baseline_l4_ecmp(
                     net,
                     topo_config,
                     ttft_ms,
@@ -1309,8 +1391,24 @@ def main() -> None:
                     max_num_batched_tokens=args.max_num_batched_tokens,
                     warmup_per_group=args.warmup_per_group,
                 )
-            elif baseline == "l7":
-                metrics = run_baseline_l7(
+            elif baseline == "l7_rr":
+                metrics = run_baseline_l7_rr(
+                    net,
+                    topo_config,
+                    ttft_ms,
+                    tpot_ms,
+                    args.max_output_tokens,
+                    workload_path,
+                    args.model,
+                    args.client_timeout,
+                    base_ttft_ms=base_ttft_ms,
+                    per_token_ttft_ms=per_token_ttft_ms,
+                    max_num_seqs=args.max_num_seqs,
+                    max_num_batched_tokens=args.max_num_batched_tokens,
+                    warmup_per_group=args.warmup_per_group,
+                )
+            elif baseline == "l7_pa":
+                metrics = run_baseline_l7_pa(
                     net,
                     topo_config,
                     ttft_ms,
@@ -1343,6 +1441,9 @@ def main() -> None:
                     max_num_batched_tokens=args.max_num_batched_tokens,
                     per_prefix_ecmp=args.per_prefix_ecmp,
                     warmup_per_group=args.warmup_per_group,
+                    coalesce_interval_s=args.coalesce_interval_s,
+                    load_update_interval_ms=args.load_update_interval_ms,
+                    load_update_delta=args.load_update_delta,
                 )
             else:
                 continue

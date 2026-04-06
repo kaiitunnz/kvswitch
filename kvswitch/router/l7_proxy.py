@@ -19,14 +19,14 @@ import asyncio
 import logging
 import time
 
-from kvswitch.router.l7_router import L7Router
+from kvswitch.router.l7_router import L7Router, RoutingResult
 from kvswitch.utils.udp import UDPClient, UDPRequest, UDPResponse, UDPServer
 
 logger = logging.getLogger(__name__)
 
 
 class L7Proxy:
-    """UDP proxy that performs L7 prefix-aware routing.
+    """UDP proxy that performs L7 routing (prefix-aware or round-robin).
 
     Parameters
     ----------
@@ -42,6 +42,8 @@ class L7Proxy:
         Token block size for prefix hashing.
     client_timeout:
         Timeout in seconds for forwarding requests to workers.
+    round_robin:
+        When True, skip prefix-aware routing and cycle through workers.
     """
 
     def __init__(
@@ -52,6 +54,7 @@ class L7Proxy:
         workers: list[tuple[str, int]] | None = None,
         block_size: int = 16,
         client_timeout: float = 30.0,
+        round_robin: bool = False,
     ) -> None:
         workers = workers or [("127.0.0.1", 8000)]
         self.router = L7Router(
@@ -61,6 +64,8 @@ class L7Proxy:
         )
         self.workers = workers
         self.client_timeout = client_timeout
+        self._round_robin = round_robin
+        self._rr_counter = 0
         self._server = UDPServer(host=host, port=port, handler=self._handle)
 
     async def _handle(self, request: UDPRequest) -> UDPResponse:
@@ -75,18 +80,29 @@ class L7Proxy:
         # --- L7 routing pipeline ---
         t_start = time.perf_counter()
 
-        # Extract prompt for routing.
-        prompt = request.data.get("prompt")
-        prompt_token_ids = request.data.get("prompt_token_ids")
-
-        if prompt is not None:
-            routing_result = self.router.route(prompt)
-        elif prompt_token_ids is not None:
-            routing_result = self.router.route_token_ids(prompt_token_ids)
+        routing_result: RoutingResult | None = None
+        if self._round_robin:
+            worker_idx = self._rr_counter % len(self.workers)
+            self._rr_counter += 1
         else:
-            return UDPResponse(data={"error": "missing prompt or prompt_token_ids"})
+            prompt = request.data.get("prompt")
+            prompt_token_ids = request.data.get("prompt_token_ids")
 
-        worker_idx = routing_result.worker_idx
+            if prompt is not None and prompt_token_ids is not None:
+                # Both fields present: tokenize the raw prompt to simulate
+                # realistic L7 tokenization delay, but use the original
+                # prompt_token_ids for the actual routing decision and
+                # forwarding to workers.
+                routing_result = self.router.route(prompt, prompt_token_ids)
+            elif prompt is not None:
+                routing_result = self.router.route(prompt)
+            elif prompt_token_ids is not None:
+                routing_result = self.router.route_token_ids(prompt_token_ids)
+            else:
+                return UDPResponse(data={"error": "missing prompt or prompt_token_ids"})
+
+            worker_idx = routing_result.worker_idx
+
         worker_host, worker_port = self.workers[worker_idx]
 
         # Forward request to the selected worker.
@@ -97,23 +113,28 @@ class L7Proxy:
         )
         worker_resp = await fwd_client.send(request.data)
 
-        # Update the router's cache directory so future requests with the
-        # same prefix are routed to this worker.
-        self.router.update_cache(worker_idx, routing_result.block_hashes)
-
         total_ms = (time.perf_counter() - t_start) * 1000
 
         # Annotate response with routing metadata.
-        worker_resp["routing"] = {
-            "worker_idx": worker_idx,
-            "matched_blocks": routing_result.matched_blocks,
-            "total_blocks": routing_result.total_blocks,
-            "tokenize_ms": routing_result.tokenize_ms,
-            "hash_ms": routing_result.hash_ms,
-            "lookup_ms": routing_result.lookup_ms,
-            "routing_ms": routing_result.total_ms,
-            "proxy_total_ms": total_ms,
-        }
+        if self._round_robin:
+            worker_resp["routing"] = {
+                "worker_idx": worker_idx,
+                "matched_blocks": 0,
+                "proxy_total_ms": total_ms,
+            }
+        else:
+            assert routing_result is not None
+            self.router.update_cache(worker_idx, routing_result.block_hashes)
+            worker_resp["routing"] = {
+                "worker_idx": worker_idx,
+                "matched_blocks": routing_result.matched_blocks,
+                "total_blocks": routing_result.total_blocks,
+                "tokenize_ms": routing_result.tokenize_ms,
+                "hash_ms": routing_result.hash_ms,
+                "lookup_ms": routing_result.lookup_ms,
+                "routing_ms": routing_result.total_ms,
+                "proxy_total_ms": total_ms,
+            }
 
         return UDPResponse(data=worker_resp)
 
@@ -161,6 +182,7 @@ if __name__ == "__main__":
         help="Comma-separated host:port pairs for backend workers",
     )
     parser.add_argument("--block-size", type=int, default=16)
+    parser.add_argument("--round-robin", action="store_true", default=False)
     parser.add_argument("--log-level", type=str, default="INFO")
     args = parser.parse_args()
 
@@ -172,5 +194,6 @@ if __name__ == "__main__":
             port=args.port,
             workers=_parse_workers(args.workers),
             block_size=args.block_size,
+            round_robin=args.round_robin,
         ).run_forever()
     )

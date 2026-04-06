@@ -14,7 +14,7 @@ class RequestMetric:
     """Metrics collected for a single request during an experiment."""
 
     request_id: int
-    baseline: str  # "l4_rr", "l7", "kvswitch"
+    baseline: str  # "l4_ecmp", "l7_rr", "l7_pa", "kvswitch"
     e2e_latency_ms: float  # Client-measured RTT
     ttft_ms: float  # Client-side TTFT estimate
     simulated_ttft_ms: float  # From mock worker response

@@ -16,7 +16,7 @@ from kvswitch.eval.metrics import (
 def _make_metric(**overrides) -> RequestMetric:
     defaults = dict(
         request_id=0,
-        baseline="l4_rr",
+        baseline="l4_ecmp",
         e2e_latency_ms=20.0,
         ttft_ms=12.0,
         simulated_ttft_ms=10.0,
@@ -87,13 +87,13 @@ class TestSerialization:
         save_experiment_results(
             experiment="test",
             config={"seed": 42},
-            results={"l4_rr": metrics},
+            results={"l4_ecmp": metrics},
             path=path,
         )
 
         loaded = load_experiment_results(path)
         assert loaded["experiment"] == "test"
         assert loaded["config"]["seed"] == 42
-        assert len(loaded["results"]["l4_rr"]["per_request"]) == 2
-        assert "summary" in loaded["results"]["l4_rr"]
-        assert loaded["results"]["l4_rr"]["summary"]["n_requests"] == 2
+        assert len(loaded["results"]["l4_ecmp"]["per_request"]) == 2
+        assert "summary" in loaded["results"]["l4_ecmp"]
+        assert loaded["results"]["l4_ecmp"]["summary"]["n_requests"] == 2
