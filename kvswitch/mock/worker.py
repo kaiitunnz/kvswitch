@@ -348,15 +348,20 @@ class MockWorker:
 
             try:
                 simulated_ttft_s = self._compute_ttft_s(uncached_tokens)
-                simulated_e2e_s = (
-                    simulated_ttft_s + max(output_tokens - 1, 0) * self.tpot_s
-                )
-                await asyncio.sleep(simulated_e2e_s)
+                tpot_s = max(output_tokens - 1, 0) * self.tpot_s
+                simulated_e2e_s = simulated_ttft_s + tpot_s
+
+                # Prefill
+                await asyncio.sleep(simulated_ttft_s)
+                self._update_local_cache(local_block_hashes)
+                self._update_export_prefix_cache(export_prefix_hashes)
+
+                # Decode
+                if tpot_s > 0:
+                    await asyncio.sleep(tpot_s)
             finally:
                 await self._release_capacity(effective_batched_tokens)
 
-            self._update_local_cache(local_block_hashes)
-            self._update_export_prefix_cache(export_prefix_hashes)
             return UDPResponse(
                 data={
                     "text": ["<mock output>"],
