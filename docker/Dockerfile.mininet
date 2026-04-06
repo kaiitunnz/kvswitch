@@ -93,4 +93,4 @@ COPY README.md ./
 RUN uv pip install --python /opt/kvswitch-venv/bin/python3 --editable . --no-deps
 
 ENTRYPOINT ["/kvswitch/docker/entrypoint.sh"]
-CMD ["exp/run_mininet.py"]
+CMD ["exp/run_eval.py"]
