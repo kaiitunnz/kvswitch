@@ -18,7 +18,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EVAL="bash $SCRIPT_DIR/run_eval.sh"
-RESULTS_BASE="results/exp"
+RESULTS_BASE="${RESULTS_BASE:-results/exp}"
 
 # --- Throttle presets ---
 MEDIUM=(--coalesce-interval-s 0.5 --load-update-interval-ms 100 --load-update-delta 100)
