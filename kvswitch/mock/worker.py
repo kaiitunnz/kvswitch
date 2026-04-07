@@ -56,6 +56,7 @@ class MockWorker:
         controller_host: str | None = None,
         controller_port: int | None = None,
         max_cached_prefixes: int | None = None,
+        kv_cache_capacity: int | None = None,
         kvswitch_port: int | None = None,
         base_ttft_ms: float | None = None,
         per_uncached_token_ttft_ms: float | None = None,
@@ -84,8 +85,26 @@ class MockWorker:
         self.worker_id = worker_id or f"{host}:{port}"
         self.controller_host = controller_host
         self.controller_port = controller_port
-        self.max_cached_prefixes = max_cached_prefixes
         self.kvswitch_port = kvswitch_port
+        if (
+            kv_cache_capacity is not None
+            and max_num_batched_tokens is not None
+            and kv_cache_capacity < max_num_batched_tokens
+        ):
+            raise ValueError(
+                f"kv_cache_capacity ({kv_cache_capacity}) must be >= "
+                f"max_num_batched_tokens ({max_num_batched_tokens})"
+            )
+        self._max_cache_blocks: int | None = None
+        self.max_cached_prefixes: int | None = max_cached_prefixes
+        if kv_cache_capacity is not None:
+            self._max_cache_blocks = kv_cache_capacity // block_size
+            if self.max_cached_prefixes is None:
+                # Intentionally loose: use block count (not chunk count) so
+                # the export prefix cache rarely evicts on its own. TCAM
+                # stability from long-lived prefix entries outweighs the
+                # occasional ghost routing from desync with block eviction.
+                self.max_cached_prefixes = self._max_cache_blocks
         self._load_update_interval_s = load_update_interval_s
         self._load_update_delta = load_update_delta
         self._last_load_update_time: float = 0.0
@@ -295,9 +314,17 @@ class MockWorker:
                 self._local_block_cache.move_to_end(block_hash)
                 continue
             self._local_block_cache[block_hash] = None
+        # Evict LRU blocks if over capacity. The export prefix cache
+        # evicts independently via its own LRU cap — no cascade from block
+        # eviction. Ghost prefix entries cause occasional cache misses but keep
+        # TCAM rules stable, which produces better overall performance than
+        # aggressive cascade.
+        if self._max_cache_blocks is not None:
+            while len(self._local_block_cache) > self._max_cache_blocks:
+                self._local_block_cache.popitem(last=False)
 
     def _update_export_prefix_cache(self, prefix_hashes: list[int]) -> None:
-        for prefix in prefix_chain(prefix_hashes, max_hashes=3):
+        for prefix in prefix_chain(prefix_hashes, max_hashes=4):
             if prefix in self._export_prefix_cache:
                 self._export_prefix_cache.move_to_end(prefix)
                 continue
@@ -489,6 +516,7 @@ if __name__ == "__main__":
     parser.add_argument("--controller-host", type=str, default=None)
     parser.add_argument("--controller-port", type=int, default=None)
     parser.add_argument("--max-cached-prefixes", type=int, default=None)
+    parser.add_argument("--kv-cache-capacity", type=int, default=None)
     parser.add_argument(
         "--kvswitch-port",
         type=int,
@@ -542,6 +570,7 @@ if __name__ == "__main__":
             controller_host=args.controller_host,
             controller_port=args.controller_port,
             max_cached_prefixes=args.max_cached_prefixes,
+            kv_cache_capacity=args.kv_cache_capacity,
             kvswitch_port=args.kvswitch_port,
             base_ttft_ms=args.base_ttft_ms,
             per_uncached_token_ttft_ms=args.per_uncached_token_ttft_ms,

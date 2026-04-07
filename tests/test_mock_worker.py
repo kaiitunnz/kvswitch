@@ -69,6 +69,27 @@ class TestMockWorkerEndpoints:
 
         asyncio.run(_run())
 
+    def test_kv_cache_evicts_lru_blocks(self) -> None:
+        async def _run() -> None:
+            # Capacity of 32 tokens = 2 blocks (block_size=16).
+            worker = MockWorker(
+                host="127.0.0.1", port=0, ttft_ms=1.0, kv_cache_capacity=32
+            )
+            await worker.start()
+            port = _get_port(worker)
+
+            client = UDPClient(host="127.0.0.1", port=port, timeout=5.0)
+            # First request: 48 tokens → 3 blocks, but capacity is 2.
+            await client.send(
+                {"endpoint": "generate", "prompt_token_ids": list(range(48))}
+            )
+            # Cache should have at most 2 blocks (LRU eviction).
+            assert len(worker._local_block_cache) == 2
+
+            worker.close()
+
+        asyncio.run(_run())
+
     def test_generate_via_kvswitch_shim_uses_header_hashes(self) -> None:
         async def _run() -> None:
             prompt_token_ids = list(range(512))

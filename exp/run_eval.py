@@ -561,6 +561,7 @@ def _start_workers(
     load_update_delta: int = 100,
     max_num_batched_tokens: int = 8192,
     max_num_seqs: int = 256,
+    kv_cache_capacity: int | None = None,
 ) -> None:
     """Start mock workers on all worker hosts."""
     for i in range(n_workers):
@@ -582,6 +583,8 @@ def _start_workers(
             )
         if per_cached_token_ttft_ms is not None:
             cmd += f" --per-cached-token-ttft-ms {per_cached_token_ttft_ms}"
+        if kv_cache_capacity is not None:
+            cmd += f" --kv-cache-capacity {kv_cache_capacity}"
         if controller_host and controller_port:
             cmd += f" --controller-host {controller_host} --controller-port {controller_port}"
         if kvswitch_port is not None:
@@ -774,6 +777,7 @@ def run_baseline_l4_ecmp(
     max_num_seqs: int = 256,
     max_num_batched_tokens: int = 8192,
     warmup_per_group: int = DEFAULT_WARMUP_PER_GROUP,
+    kv_cache_capacity: int | None = None,
 ) -> list[RequestMetric]:
     """L4 Round-Robin: uniform ECMP distributes traffic via KVSwitch VIP."""
     logger.info("--- Baseline: L4 Round-Robin ---")
@@ -794,6 +798,7 @@ def run_baseline_l4_ecmp(
         ttft_ms=ttft_ms,
         max_num_seqs=max_num_seqs,
         max_num_batched_tokens=max_num_batched_tokens,
+        kv_cache_capacity=kv_cache_capacity,
     )
 
     client = _get_node(net, "client")
@@ -846,6 +851,7 @@ def _run_l7_baseline(
     max_num_seqs: int = 256,
     max_num_batched_tokens: int = 8192,
     warmup_per_group: int = DEFAULT_WARMUP_PER_GROUP,
+    kv_cache_capacity: int | None = None,
 ) -> list[RequestMetric]:
     mode = "Round-Robin" if round_robin else "Prefix-Aware"
     logger.info("--- Baseline: L7 %s Router ---", mode)
@@ -861,6 +867,7 @@ def _run_l7_baseline(
         ttft_ms=ttft_ms,
         max_num_seqs=max_num_seqs,
         max_num_batched_tokens=max_num_batched_tokens,
+        kv_cache_capacity=kv_cache_capacity,
     )
 
     # Start L7 proxy on the router host.
@@ -928,6 +935,7 @@ def run_baseline_l7_rr(
     max_num_seqs: int = 256,
     max_num_batched_tokens: int = 8192,
     warmup_per_group: int = DEFAULT_WARMUP_PER_GROUP,
+    kv_cache_capacity: int | None = None,
 ) -> list[RequestMetric]:
     """L7 Round-Robin: Client → L7 proxy (round-robin) → worker."""
     return _run_l7_baseline(
@@ -946,6 +954,7 @@ def run_baseline_l7_rr(
         per_cached_token_ttft_ms=per_cached_token_ttft_ms,
         max_num_seqs=max_num_seqs,
         max_num_batched_tokens=max_num_batched_tokens,
+        kv_cache_capacity=kv_cache_capacity,
         warmup_per_group=warmup_per_group,
     )
 
@@ -965,6 +974,7 @@ def run_baseline_l7_pa(
     max_num_seqs: int = 256,
     max_num_batched_tokens: int = 8192,
     warmup_per_group: int = DEFAULT_WARMUP_PER_GROUP,
+    kv_cache_capacity: int | None = None,
 ) -> list[RequestMetric]:
     """L7 Prefix-Aware: Client → L7 proxy (prefix-aware) → best worker."""
     return _run_l7_baseline(
@@ -983,6 +993,7 @@ def run_baseline_l7_pa(
         per_cached_token_ttft_ms=per_cached_token_ttft_ms,
         max_num_seqs=max_num_seqs,
         max_num_batched_tokens=max_num_batched_tokens,
+        kv_cache_capacity=kv_cache_capacity,
         warmup_per_group=warmup_per_group,
     )
 
@@ -1042,6 +1053,7 @@ def run_baseline_kvswitch(
     coalesce_interval_s: float = 0.5,
     load_update_interval_ms: float = 100.0,
     load_update_delta: int = 100,
+    kv_cache_capacity: int | None = None,
 ) -> list[RequestMetric]:
     """KVSwitch: SDN controller populates TCAM; switches route shim-header traffic."""
     logger.info("--- Baseline: KVSwitch ---")
@@ -1087,6 +1099,7 @@ def run_baseline_kvswitch(
             ttft_ms=ttft_ms,
             max_num_seqs=max_num_seqs,
             max_num_batched_tokens=max_num_batched_tokens,
+            kv_cache_capacity=kv_cache_capacity,
             load_update_interval_ms=load_update_interval_ms,
             load_update_delta=load_update_delta,
         )
@@ -1222,6 +1235,7 @@ def main() -> None:
     parser.add_argument("--admission-threshold", type=int, default=2)
     parser.add_argument("--max-num-seqs", type=int, default=256)
     parser.add_argument("--max-num-batched-tokens", type=int, default=8192)
+    parser.add_argument("--kv-cache-capacity", type=int, default=8192)
     parser.add_argument("--coalesce-interval-s", type=float, default=0.5)
     parser.add_argument("--load-update-interval-ms", type=float, default=100.0)
     parser.add_argument("--load-update-delta", type=int, default=100)
@@ -1420,6 +1434,7 @@ def main() -> None:
                     per_cached_token_ttft_ms=per_cached_token_ttft_ms,
                     max_num_seqs=args.max_num_seqs,
                     max_num_batched_tokens=args.max_num_batched_tokens,
+                    kv_cache_capacity=args.kv_cache_capacity,
                     warmup_per_group=args.warmup_per_group,
                 )
             elif baseline == "l7_rr":
@@ -1437,6 +1452,7 @@ def main() -> None:
                     per_cached_token_ttft_ms=per_cached_token_ttft_ms,
                     max_num_seqs=args.max_num_seqs,
                     max_num_batched_tokens=args.max_num_batched_tokens,
+                    kv_cache_capacity=args.kv_cache_capacity,
                     warmup_per_group=args.warmup_per_group,
                 )
             elif baseline == "l7_pa":
@@ -1454,6 +1470,7 @@ def main() -> None:
                     per_cached_token_ttft_ms=per_cached_token_ttft_ms,
                     max_num_seqs=args.max_num_seqs,
                     max_num_batched_tokens=args.max_num_batched_tokens,
+                    kv_cache_capacity=args.kv_cache_capacity,
                     warmup_per_group=args.warmup_per_group,
                 )
             elif baseline == "kvswitch":
@@ -1473,6 +1490,7 @@ def main() -> None:
                     admission_threshold=args.admission_threshold,
                     max_num_seqs=args.max_num_seqs,
                     max_num_batched_tokens=args.max_num_batched_tokens,
+                    kv_cache_capacity=args.kv_cache_capacity,
                     per_prefix_ecmp=args.per_prefix_ecmp,
                     warmup_per_group=args.warmup_per_group,
                     coalesce_interval_s=args.coalesce_interval_s,
@@ -1523,6 +1541,7 @@ def main() -> None:
         "per_uncached_token_ttft_ms": per_uncached_token_ttft_ms,
         "tpot_ms": tpot_ms,
         "delay": args.delay,
+        "kv_cache_capacity": args.kv_cache_capacity,
         "model": args.model,
         "p4_json": args.p4_json,
         "seed": args.seed,
