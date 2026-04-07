@@ -58,7 +58,8 @@ class MockWorker:
         max_cached_prefixes: int | None = None,
         kvswitch_port: int | None = None,
         base_ttft_ms: float | None = None,
-        per_token_ttft_ms: float | None = None,
+        per_uncached_token_ttft_ms: float | None = None,
+        per_cached_token_ttft_ms: float | None = None,
         load_update_interval_s: float = 0.0,
         load_update_delta: int = 0,
     ) -> None:
@@ -67,8 +68,15 @@ class MockWorker:
         self.ttft_s = ttft_ms / 1000.0
         self.tpot_s = tpot_ms / 1000.0
         self._base_ttft_s = base_ttft_ms / 1000.0 if base_ttft_ms is not None else None
-        self._per_token_ttft_s = (
-            per_token_ttft_ms / 1000.0 if per_token_ttft_ms is not None else None
+        self._per_uncached_token_ttft_s = (
+            per_uncached_token_ttft_ms / 1000.0
+            if per_uncached_token_ttft_ms is not None
+            else None
+        )
+        self._per_cached_token_ttft_s = (
+            per_cached_token_ttft_ms / 1000.0
+            if per_cached_token_ttft_ms is not None
+            else None
         )
         self.max_num_seqs = max_num_seqs
         self.max_num_batched_tokens = max_num_batched_tokens
@@ -131,18 +139,25 @@ class MockWorker:
             matched += 1
         return matched
 
-    def _compute_ttft_s(self, uncached_tokens: int) -> float:
-        """Compute TTFT based on uncached token count.
+    def _compute_ttft_s(self, cached_tokens: int, uncached_tokens: int) -> float:
+        """Compute TTFT from cached and uncached token counts.
 
-        If ``base_ttft_ms`` and ``per_token_ttft_ms`` were provided at
-        construction, TTFT is calculated as
+        Uses a three-coefficient model fitted from GPU profiling traces::
 
-        ``ttft = base_ttft + per_token_ttft * uncached_tokens``
+            ttft = base + per_cached * cached + per_uncached * uncached
 
-        Otherwise, the fixed ``ttft_ms`` is used.
+        Falls back to the two-coefficient model (ignoring cached cost) if
+        ``per_cached_token_ttft_ms`` was not provided, or to the fixed
+        ``ttft_ms`` if no linear model parameters were set at all.
         """
-        if self._base_ttft_s is not None and self._per_token_ttft_s is not None:
-            return self._base_ttft_s + self._per_token_ttft_s * uncached_tokens
+        if (
+            self._base_ttft_s is not None
+            and self._per_uncached_token_ttft_s is not None
+        ):
+            ttft = self._base_ttft_s + self._per_uncached_token_ttft_s * uncached_tokens
+            if self._per_cached_token_ttft_s is not None:
+                ttft += self._per_cached_token_ttft_s * cached_tokens
+            return ttft
         return self.ttft_s
 
     def _ensure_event_sock(self) -> socket.socket | None:
@@ -347,7 +362,9 @@ class MockWorker:
                 )
 
             try:
-                simulated_ttft_s = self._compute_ttft_s(uncached_tokens)
+                simulated_ttft_s = self._compute_ttft_s(
+                    num_cached_tokens, uncached_tokens
+                )
                 tpot_s = max(output_tokens - 1, 0) * self.tpot_s
                 simulated_e2e_s = simulated_ttft_s + tpot_s
 
@@ -407,8 +424,14 @@ class MockWorker:
             )
 
         self._emit_load_update(force=True)
-        if self._base_ttft_s is not None and self._per_token_ttft_s is not None:
-            ttft_desc = f"base_ttft={self._base_ttft_s*1000:.1f}ms + {self._per_token_ttft_s*1000:.5f}ms/token"
+        if (
+            self._base_ttft_s is not None
+            and self._per_uncached_token_ttft_s is not None
+        ):
+            ttft_desc = (
+                f"base_ttft={self._base_ttft_s*1000:.1f}ms + "
+                f"{self._per_uncached_token_ttft_s*1000:.5f}ms/token"
+            )
         else:
             ttft_desc = f"ttft={self.ttft_s*1000:.1f}ms"
         logger.info(
@@ -479,10 +502,16 @@ if __name__ == "__main__":
         help="Baseline TTFT when fully cached (enables linear TTFT model)",
     )
     parser.add_argument(
-        "--per-token-ttft-ms",
+        "--per-uncached-token-ttft-ms",
         type=float,
         default=None,
         help="Marginal TTFT per uncached token (enables linear TTFT model)",
+    )
+    parser.add_argument(
+        "--per-cached-token-ttft-ms",
+        type=float,
+        default=None,
+        help="Marginal TTFT per cached token (extends the linear TTFT model)",
     )
     parser.add_argument(
         "--load-update-interval-ms",
@@ -515,7 +544,8 @@ if __name__ == "__main__":
             max_cached_prefixes=args.max_cached_prefixes,
             kvswitch_port=args.kvswitch_port,
             base_ttft_ms=args.base_ttft_ms,
-            per_token_ttft_ms=args.per_token_ttft_ms,
+            per_uncached_token_ttft_ms=args.per_uncached_token_ttft_ms,
+            per_cached_token_ttft_ms=args.per_cached_token_ttft_ms,
             load_update_interval_s=args.load_update_interval_ms / 1000.0,
             load_update_delta=args.load_update_delta,
         ).run_forever()

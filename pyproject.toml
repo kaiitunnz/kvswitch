@@ -7,7 +7,9 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     "finsy>=0.26.0",
     "mininet>=2.3.0.dev6",
+    "numpy>=2.4.4",
     "pandas>=3.0.1",
+    "scipy>=1.17.1",
 ]
 
 [project.optional-dependencies]

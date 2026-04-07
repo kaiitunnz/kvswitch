@@ -742,7 +742,7 @@ def test_warmup_populates_both_tcam_and_worker_cache() -> None:
             controller_port=controller.port,
             max_cached_prefixes=8,
             base_ttft_ms=10.0,
-            per_token_ttft_ms=0.5,
+            per_uncached_token_ttft_ms=0.5,
         )
         await worker.start()
         assert worker.kvswitch_port is not None

@@ -491,7 +491,7 @@ class TestCacheAwareTTFT:
                 host="127.0.0.1",
                 port=0,
                 base_ttft_ms=10.0,
-                per_token_ttft_ms=0.5,
+                per_uncached_token_ttft_ms=0.5,
                 tpot_ms=0.0,
                 max_num_seqs=1,
             )
@@ -526,7 +526,7 @@ class TestCacheAwareTTFT:
                 host="127.0.0.1",
                 port=0,
                 base_ttft_ms=10.0,
-                per_token_ttft_ms=0.5,
+                per_uncached_token_ttft_ms=0.5,
                 tpot_ms=0.0,
             )
             await worker.start()
@@ -557,7 +557,7 @@ class TestCacheAwareTTFT:
                 host="127.0.0.1",
                 port=0,
                 base_ttft_ms=5.0,
-                per_token_ttft_ms=0.01,
+                per_uncached_token_ttft_ms=0.01,
                 tpot_ms=0.0,
                 max_num_batched_tokens=50,
             )

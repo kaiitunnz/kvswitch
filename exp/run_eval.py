@@ -23,6 +23,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
 
+import numpy as np
+from scipy.optimize import nnls
+
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -116,37 +119,33 @@ def build_latency_tables(
     return ttft_table, tpot_table
 
 
-def fit_linear_ttft_model(
+def fit_ttft_model(
     traces_path: Path,
-) -> tuple[float, float]:
-    """Fit TTFT_ms = base + per_token * uncached_tokens from profiling traces.
+) -> tuple[float, float, float]:
+    """Fit TTFT_ms = base + per_cached * cached + per_uncached * uncached.
 
-    Returns ``(base_ttft_ms, per_token_ttft_ms)``.
+    Uses non-negative least squares on profiling traces so all coefficients
+    are physically meaningful (no negative costs).
+
+    Returns ``(base_ttft_ms, per_cached_token_ttft_ms, per_uncached_token_ttft_ms)``.
     """
     results = load_results_csv(traces_path)
-    xs: list[float] = []  # uncached_tokens
-    ys: list[float] = []  # ttft_ms
-    for r in results:
-        uncached = r.prompt_tokens - r.num_cached_tokens
-        xs.append(float(uncached))
-        ys.append(r.ttft * 1000)
+    if len(results) < 3:
+        return 12.27, 0.00094, 0.01404
 
-    n = len(xs)
-    if n < 2:
-        return 12.0, 0.014  # sensible defaults
-
-    # From closed-form solution to linear regression
-    mean_x = sum(xs) / n
-    mean_y = sum(ys) / n
-    ss_xy = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
-    ss_xx = sum((x - mean_x) ** 2 for x in xs)
-
-    if ss_xx == 0:
-        return mean_y, 0.0
-
-    per_token = ss_xy / ss_xx
-    base = mean_y - per_token * mean_x
-    return max(base, 0.0), max(per_token, 0.0)
+    X = np.array(
+        [
+            [
+                1.0,
+                float(r.num_cached_tokens),
+                float(r.prompt_tokens - r.num_cached_tokens),
+            ]
+            for r in results
+        ]
+    )
+    y = np.array([r.ttft * 1000 for r in results])
+    coeffs, _ = nnls(X, y)
+    return float(coeffs[0]), float(coeffs[1]), float(coeffs[2])
 
 
 # ---------------------------------------------------------------------------
@@ -555,7 +554,8 @@ def _start_workers(
     controller_port: int | None = None,
     kvswitch_port: int | None = None,
     base_ttft_ms: float | None = None,
-    per_token_ttft_ms: float | None = None,
+    per_uncached_token_ttft_ms: float | None = None,
+    per_cached_token_ttft_ms: float | None = None,
     ttft_ms: float = 10.0,
     load_update_interval_ms: float = 100.0,
     load_update_delta: int = 100,
@@ -575,8 +575,13 @@ def _start_workers(
             f" --max-num-batched-tokens {max_num_batched_tokens}"
             f" --max-num-seqs {max_num_seqs}"
         )
-        if base_ttft_ms is not None and per_token_ttft_ms is not None:
-            cmd += f" --base-ttft-ms {base_ttft_ms} --per-token-ttft-ms {per_token_ttft_ms}"
+        if base_ttft_ms is not None and per_uncached_token_ttft_ms is not None:
+            cmd += (
+                f" --base-ttft-ms {base_ttft_ms} "
+                f"--per-uncached-token-ttft-ms {per_uncached_token_ttft_ms}"
+            )
+        if per_cached_token_ttft_ms is not None:
+            cmd += f" --per-cached-token-ttft-ms {per_cached_token_ttft_ms}"
         if controller_host and controller_port:
             cmd += f" --controller-host {controller_host} --controller-port {controller_port}"
         if kvswitch_port is not None:
@@ -764,7 +769,8 @@ def run_baseline_l4_ecmp(
     client_timeout: float,
     adapter: FinsyAdapter,
     base_ttft_ms: float | None = None,
-    per_token_ttft_ms: float | None = None,
+    per_uncached_token_ttft_ms: float | None = None,
+    per_cached_token_ttft_ms: float | None = None,
     max_num_seqs: int = 256,
     max_num_batched_tokens: int = 8192,
     warmup_per_group: int = DEFAULT_WARMUP_PER_GROUP,
@@ -783,7 +789,8 @@ def run_baseline_l4_ecmp(
         max_output_tokens,
         kvswitch_port=KVSWITCH_UDP_PORT,
         base_ttft_ms=base_ttft_ms,
-        per_token_ttft_ms=per_token_ttft_ms,
+        per_uncached_token_ttft_ms=per_uncached_token_ttft_ms,
+        per_cached_token_ttft_ms=per_cached_token_ttft_ms,
         ttft_ms=ttft_ms,
         max_num_seqs=max_num_seqs,
         max_num_batched_tokens=max_num_batched_tokens,
@@ -834,7 +841,8 @@ def _run_l7_baseline(
     baseline_name: str,
     round_robin: bool = False,
     base_ttft_ms: float | None = None,
-    per_token_ttft_ms: float | None = None,
+    per_uncached_token_ttft_ms: float | None = None,
+    per_cached_token_ttft_ms: float | None = None,
     max_num_seqs: int = 256,
     max_num_batched_tokens: int = 8192,
     warmup_per_group: int = DEFAULT_WARMUP_PER_GROUP,
@@ -848,7 +856,8 @@ def _run_l7_baseline(
         tpot_ms,
         max_output_tokens,
         base_ttft_ms=base_ttft_ms,
-        per_token_ttft_ms=per_token_ttft_ms,
+        per_uncached_token_ttft_ms=per_uncached_token_ttft_ms,
+        per_cached_token_ttft_ms=per_cached_token_ttft_ms,
         ttft_ms=ttft_ms,
         max_num_seqs=max_num_seqs,
         max_num_batched_tokens=max_num_batched_tokens,
@@ -914,7 +923,8 @@ def run_baseline_l7_rr(
     model: str,
     client_timeout: float,
     base_ttft_ms: float | None = None,
-    per_token_ttft_ms: float | None = None,
+    per_uncached_token_ttft_ms: float | None = None,
+    per_cached_token_ttft_ms: float | None = None,
     max_num_seqs: int = 256,
     max_num_batched_tokens: int = 8192,
     warmup_per_group: int = DEFAULT_WARMUP_PER_GROUP,
@@ -932,7 +942,8 @@ def run_baseline_l7_rr(
         baseline_name="l7_rr",
         round_robin=True,
         base_ttft_ms=base_ttft_ms,
-        per_token_ttft_ms=per_token_ttft_ms,
+        per_uncached_token_ttft_ms=per_uncached_token_ttft_ms,
+        per_cached_token_ttft_ms=per_cached_token_ttft_ms,
         max_num_seqs=max_num_seqs,
         max_num_batched_tokens=max_num_batched_tokens,
         warmup_per_group=warmup_per_group,
@@ -949,7 +960,8 @@ def run_baseline_l7_pa(
     model: str,
     client_timeout: float,
     base_ttft_ms: float | None = None,
-    per_token_ttft_ms: float | None = None,
+    per_uncached_token_ttft_ms: float | None = None,
+    per_cached_token_ttft_ms: float | None = None,
     max_num_seqs: int = 256,
     max_num_batched_tokens: int = 8192,
     warmup_per_group: int = DEFAULT_WARMUP_PER_GROUP,
@@ -967,7 +979,8 @@ def run_baseline_l7_pa(
         baseline_name="l7_pa",
         round_robin=False,
         base_ttft_ms=base_ttft_ms,
-        per_token_ttft_ms=per_token_ttft_ms,
+        per_uncached_token_ttft_ms=per_uncached_token_ttft_ms,
+        per_cached_token_ttft_ms=per_cached_token_ttft_ms,
         max_num_seqs=max_num_seqs,
         max_num_batched_tokens=max_num_batched_tokens,
         warmup_per_group=warmup_per_group,
@@ -1019,7 +1032,8 @@ def run_baseline_kvswitch(
     adapter: FinsyAdapter,
     controller_runtime: AsyncLoopThread,
     base_ttft_ms: float | None = None,
-    per_token_ttft_ms: float | None = None,
+    per_uncached_token_ttft_ms: float | None = None,
+    per_cached_token_ttft_ms: float | None = None,
     admission_threshold: int = 2,
     max_num_seqs: int = 256,
     max_num_batched_tokens: int = 8192,
@@ -1068,7 +1082,8 @@ def run_baseline_kvswitch(
             controller_port=CONTROLLER_PORT,
             kvswitch_port=KVSWITCH_UDP_PORT,
             base_ttft_ms=base_ttft_ms,
-            per_token_ttft_ms=per_token_ttft_ms,
+            per_uncached_token_ttft_ms=per_uncached_token_ttft_ms,
+            per_cached_token_ttft_ms=per_cached_token_ttft_ms,
             ttft_ms=ttft_ms,
             max_num_seqs=max_num_seqs,
             max_num_batched_tokens=max_num_batched_tokens,
@@ -1186,10 +1201,16 @@ def main() -> None:
         help="Override base TTFT for linear model (else fitted from traces)",
     )
     parser.add_argument(
-        "--per-token-ttft-ms",
+        "--per-uncached-token-ttft-ms",
         type=float,
         default=None,
-        help="Override per-token TTFT for linear model (else fitted from traces)",
+        help="Override per-uncached-token TTFT (else fitted from traces)",
+    )
+    parser.add_argument(
+        "--per-cached-token-ttft-ms",
+        type=float,
+        default=None,
+        help="Override per-cached-token TTFT (else fitted from traces)",
     )
     parser.add_argument("--client-timeout", type=float, default=60.0)
     parser.add_argument(
@@ -1244,19 +1265,28 @@ def main() -> None:
     ttft_ms = args.ttft_ms or ttft_table.get((1024, 0.0), 15.0)
     tpot_ms = args.tpot_ms or tpot_table.get((1024, 0.0), 3.0)
 
-    # Fit the linear TTFT model from traces (or use CLI overrides).
-    if args.base_ttft_ms is not None and args.per_token_ttft_ms is not None:
+    # Fit the TTFT model from traces (or use CLI overrides).
+    if args.base_ttft_ms is not None and args.per_uncached_token_ttft_ms is not None:
         base_ttft_ms = args.base_ttft_ms
-        per_token_ttft_ms = args.per_token_ttft_ms
+        per_cached_token_ttft_ms = args.per_cached_token_ttft_ms
+        per_uncached_token_ttft_ms = args.per_uncached_token_ttft_ms
     elif traces_path.exists():
-        base_ttft_ms, per_token_ttft_ms = fit_linear_ttft_model(traces_path)
+        base_ttft_ms, per_cached_token_ttft_ms, per_uncached_token_ttft_ms = (
+            fit_ttft_model(traces_path)
+        )
     else:
-        base_ttft_ms, per_token_ttft_ms = 12.9, 0.01406  # sensible defaults
+        base_ttft_ms, per_cached_token_ttft_ms, per_uncached_token_ttft_ms = (
+            12.27,
+            0.00094,
+            0.01404,
+        )
 
     logger.info(
-        "Using TTFT model: base=%.2fms + %.5fms/uncached_token (fallback fixed=%.2fms), TPOT=%.2fms",
+        "Using TTFT model: base=%.2fms + %.6fms/cached + %.5fms/uncached "
+        "(fallback fixed=%.2fms), TPOT=%.2fms",
         base_ttft_ms,
-        per_token_ttft_ms,
+        per_cached_token_ttft_ms if per_cached_token_ttft_ms is not None else 0.0,
+        per_uncached_token_ttft_ms,
         ttft_ms,
         tpot_ms,
     )
@@ -1386,7 +1416,8 @@ def main() -> None:
                     args.client_timeout,
                     adapter=finsy_adapter,
                     base_ttft_ms=base_ttft_ms,
-                    per_token_ttft_ms=per_token_ttft_ms,
+                    per_uncached_token_ttft_ms=per_uncached_token_ttft_ms,
+                    per_cached_token_ttft_ms=per_cached_token_ttft_ms,
                     max_num_seqs=args.max_num_seqs,
                     max_num_batched_tokens=args.max_num_batched_tokens,
                     warmup_per_group=args.warmup_per_group,
@@ -1402,7 +1433,8 @@ def main() -> None:
                     args.model,
                     args.client_timeout,
                     base_ttft_ms=base_ttft_ms,
-                    per_token_ttft_ms=per_token_ttft_ms,
+                    per_uncached_token_ttft_ms=per_uncached_token_ttft_ms,
+                    per_cached_token_ttft_ms=per_cached_token_ttft_ms,
                     max_num_seqs=args.max_num_seqs,
                     max_num_batched_tokens=args.max_num_batched_tokens,
                     warmup_per_group=args.warmup_per_group,
@@ -1418,7 +1450,8 @@ def main() -> None:
                     args.model,
                     args.client_timeout,
                     base_ttft_ms=base_ttft_ms,
-                    per_token_ttft_ms=per_token_ttft_ms,
+                    per_uncached_token_ttft_ms=per_uncached_token_ttft_ms,
+                    per_cached_token_ttft_ms=per_cached_token_ttft_ms,
                     max_num_seqs=args.max_num_seqs,
                     max_num_batched_tokens=args.max_num_batched_tokens,
                     warmup_per_group=args.warmup_per_group,
@@ -1435,7 +1468,8 @@ def main() -> None:
                     adapter=finsy_adapter,
                     controller_runtime=controller_runtime,
                     base_ttft_ms=base_ttft_ms,
-                    per_token_ttft_ms=per_token_ttft_ms,
+                    per_uncached_token_ttft_ms=per_uncached_token_ttft_ms,
+                    per_cached_token_ttft_ms=per_cached_token_ttft_ms,
                     admission_threshold=args.admission_threshold,
                     max_num_seqs=args.max_num_seqs,
                     max_num_batched_tokens=args.max_num_batched_tokens,
@@ -1485,7 +1519,8 @@ def main() -> None:
         "max_output_tokens": args.max_output_tokens,
         "ttft_ms": ttft_ms,
         "base_ttft_ms": base_ttft_ms,
-        "per_token_ttft_ms": per_token_ttft_ms,
+        "per_cached_token_ttft_ms": per_cached_token_ttft_ms,
+        "per_uncached_token_ttft_ms": per_uncached_token_ttft_ms,
         "tpot_ms": tpot_ms,
         "delay": args.delay,
         "model": args.model,
