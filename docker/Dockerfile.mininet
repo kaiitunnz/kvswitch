@@ -77,14 +77,7 @@ COPY pyproject.toml uv.lock ./
 RUN uv venv --python 3.12 \
     && uv sync --frozen --no-install-project
 
-# 2. Install vendored vLLM in its own layer.
-COPY .git/modules/3rdparty/vllm ./.git/modules/3rdparty/vllm
-COPY 3rdparty/vllm ./3rdparty/vllm
-RUN VLLM_USE_PRECOMPILED=1 \
-    VLLM_PRECOMPILED_WHEEL_COMMIT=89a77b10846fd96273cce78d86d2556ea582d26e \
-    uv pip install --python /opt/kvswitch-venv/bin/python3 ./3rdparty/vllm
-
-# 3. Copy the runtime project files and install the local package.
+# 2. Copy the runtime project files and install the local package.
 COPY kvswitch ./kvswitch
 COPY exp ./exp
 COPY scripts ./scripts

@@ -11,7 +11,7 @@ import logging
 import time
 from dataclasses import dataclass
 
-from vllm.tokenizers import get_tokenizer
+from transformers import AutoTokenizer
 
 from kvswitch.utils.prefix import cumulative_sha256_chain
 
@@ -54,7 +54,7 @@ class L7Router:
         n_workers: int = 1,
         block_size: int = 16,
     ) -> None:
-        self.tokenizer = get_tokenizer(model)
+        self.tokenizer = AutoTokenizer.from_pretrained(model)
         self.n_workers = n_workers
         self.block_size = block_size
 

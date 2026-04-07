@@ -125,9 +125,9 @@ class WorkloadGenerator:
 
     def _get_tokenizer(self) -> Any:
         if self._tokenizer is None:
-            from vllm.tokenizers import get_tokenizer
+            from transformers import AutoTokenizer
 
-            self._tokenizer = get_tokenizer(self.config.model)
+            self._tokenizer = AutoTokenizer.from_pretrained(self.config.model)
         return self._tokenizer
 
     def generate(self) -> list[WorkloadRequest]:
