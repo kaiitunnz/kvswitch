@@ -8,7 +8,7 @@ __pycache__/
 
 # Distribution / packaging
 .Python
-build/
+build/*
 develop-eggs/
 dist/
 downloads/
@@ -225,3 +225,7 @@ tmp/
 # Data files
 data/
 results/
+
+# Artifacts
+!build/p4/
+*.p4i
