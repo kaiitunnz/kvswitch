@@ -34,6 +34,7 @@ from kvswitch.utils.udp import UDPRequest, UDPResponse, UDPServer
 logger = logging.getLogger(__name__)
 
 EventType = Literal["alloc", "evict", "queue_update"]
+HASH_FIELDS = tuple(f"hdr.kvswitch.h{i}" for i in range(4))
 ECMP_BUCKETS = 32
 
 
@@ -631,9 +632,7 @@ class SDNController:
             ops: list[SwitchOp] = []
             # Build leaf_prefix_route match.
             match: dict[str, str | int] = {}
-            for idx, field_name in enumerate(
-                ("hdr.kvswitch.h0", "hdr.kvswitch.h1", "hdr.kvswitch.h2")
-            ):
+            for idx, field_name in enumerate(HASH_FIELDS):
                 value = prefix[idx] if idx < len(prefix) else 0
                 mask = 0xFFFFFFFF if idx < len(prefix) else 0
                 match[field_name] = f"0x{value:08x}&&&0x{mask:08x}"
@@ -722,9 +721,7 @@ class SDNController:
         ops: list[SwitchOp] = []
         # Delete leaf_prefix_route entry.
         match: dict[str, str | int] = {}
-        for idx, field_name in enumerate(
-            ("hdr.kvswitch.h0", "hdr.kvswitch.h1", "hdr.kvswitch.h2")
-        ):
+        for idx, field_name in enumerate(HASH_FIELDS):
             value = prefix[idx] if idx < len(prefix) else 0
             mask = 0xFFFFFFFF if idx < len(prefix) else 0
             match[field_name] = f"0x{value:08x}&&&0x{mask:08x}"

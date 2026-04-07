@@ -123,6 +123,7 @@ control KVSwitchIngress(
             hdr.kvswitch.h0: ternary;
             hdr.kvswitch.h1: ternary;
             hdr.kvswitch.h2: ternary;
+            hdr.kvswitch.h3: ternary;
         }
         actions = {
             set_leaf_prefix_ecmp_group;

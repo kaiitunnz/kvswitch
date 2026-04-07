@@ -87,7 +87,7 @@ def spine_prefix_key(prefix_hashes: Iterable[Any]) -> tuple[int, ...]:
 
 def leaf_prefix_key(
     prefix_hashes: Iterable[Any],
-    depth: int = 3,
+    depth: int = 4,
 ) -> tuple[int, ...]:
     """Return the leaf prefix key truncated to the requested depth."""
     normalized = normalize_prefix_hashes(prefix_hashes, max_hashes=depth)
