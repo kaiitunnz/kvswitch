@@ -5,9 +5,9 @@
 #   bash exp/run_eval.sh [extra args...]
 #
 # Examples:
-#   bash exp/run_eval.sh --baselines l4_rr --num-requests 20 --n-workers 2
-#   bash exp/run_eval.sh --baselines l4_rr,l7,kvswitch --request-rate 10
-#   bash exp/run_eval.sh --prefix-sharing-ratio 0.75 --delay 0.1ms
+#   bash exp/run_eval.sh --baselines l4_ecmp --num-requests 20
+#   bash exp/run_eval.sh --baselines l4_ecmp,l7_rr,l7_pa,kvswitch --request-rate 10
+#   bash exp/run_eval.sh --prefix-sharing-ratio 0.75
 
 set -euo pipefail
 
