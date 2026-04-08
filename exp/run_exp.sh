@@ -25,7 +25,7 @@ MEDIUM=(--coalesce-interval-s 0.5 --load-update-interval-ms 100 --load-update-de
 SLOW=(--coalesce-interval-s 2.0 --load-update-interval-ms 500 --load-update-delta 500)
 
 # --- Common fixed parameters ---
-COMMON=(--delay 0.5ms --prefix-sharing-ratio 0.8 --admission-threshold 2 --seed 42)
+COMMON=(--delay 0.5ms --admission-threshold 2 --seed 42)
 ALL4="l4_ecmp,l7_rr,l7_pa,kvswitch"
 
 # --- Constrained resource parameters ---

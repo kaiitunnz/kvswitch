@@ -1225,11 +1225,11 @@ def main() -> None:
         default=None,
         help="Override per-cached-token TTFT (else fitted from traces)",
     )
-    parser.add_argument("--client-timeout", type=float, default=60.0)
+    parser.add_argument("--client-timeout", type=float, default=270.0)
     parser.add_argument(
         "--max-kvswitch-payload",
         type=int,
-        default=9000,
+        default=8900,
         help="Drop KVSwitch requests whose UDP payload exceeds this size in bytes",
     )
     parser.add_argument("--admission-threshold", type=int, default=2)

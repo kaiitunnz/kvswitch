@@ -34,6 +34,8 @@ from typing import Any
 from kvswitch.sdk.client import KVSwitchUDPClient
 from kvswitch.utils.udp import UDPClient
 
+DEFAULT_MAX_RETRIES = 3
+
 
 def _estimate_ttft_ms(e2e_ms: float, response: dict[str, Any]) -> float | None:
     """Estimate client-side TTFT from worker simulation plus residual latency."""
@@ -54,6 +56,7 @@ async def _send_one(
     timeout: float,
     t0: float,
     kvswitch: bool = False,
+    max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> dict:
     """Send a single request and return a metric dict."""
     actual_send = time.perf_counter() - t0
@@ -68,20 +71,32 @@ async def _send_one(
     if not kvswitch and "prefix_hashes" in request:
         payload["prefix_hashes"] = request["prefix_hashes"]
 
-    start = time.perf_counter()
-    try:
-        if kvswitch:
-            kv_client = KVSwitchUDPClient(host=host, port=port, timeout=timeout)
-            resp = await kv_client.send(
-                payload,
-                prefix_hashes=request.get("prefix_hashes"),
-                req_id=request.get("request_id", 0),
-            )
-        else:
-            udp_client = UDPClient(host=host, port=port, timeout=timeout)
-            resp = await udp_client.send(payload)
-    except Exception as exc:
-        resp = {"error": str(exc)}
+    per_attempt_timeout = timeout / max(max_retries, 1)
+    resp: dict[str, Any] = {}
+    start = 0.0
+    for _ in range(max_retries):
+        # Measure only the successful attempt for e2e latency.
+        start = time.perf_counter()
+        try:
+            if kvswitch:
+                kv_client = KVSwitchUDPClient(
+                    host=host, port=port, timeout=per_attempt_timeout
+                )
+                resp = await kv_client.send(
+                    payload,
+                    prefix_hashes=request.get("prefix_hashes"),
+                    req_id=request.get("request_id", 0),
+                )
+            else:
+                udp_client = UDPClient(
+                    host=host, port=port, timeout=per_attempt_timeout
+                )
+                resp = await udp_client.send(payload)
+            break
+        except Exception:
+            pass
+    else:
+        resp = {"error": "all retries failed"}
     e2e_ms = (time.perf_counter() - start) * 1000
     ttft_ms = _estimate_ttft_ms(e2e_ms, resp)
 
@@ -118,6 +133,7 @@ async def run_workload(
     port: int,
     timeout: float,
     kvswitch: bool = False,
+    max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> list[dict]:
     """Load workload JSON, fire requests at scheduled times, collect results."""
     with open(workload_path) as f:
@@ -132,7 +148,15 @@ async def run_workload(
             await asyncio.sleep(delay)
         tasks.append(
             asyncio.create_task(
-                _send_one(req, host, port, timeout, t0, kvswitch=kvswitch)
+                _send_one(
+                    req,
+                    host,
+                    port,
+                    timeout,
+                    t0,
+                    kvswitch=kvswitch,
+                    max_retries=max_retries,
+                )
             )
         )
 
@@ -154,6 +178,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         action="store_true",
         help="Send with KVSwitch shim header on port 4789 for BMv2 switch routing",
     )
+    parser.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES)
     args = parser.parse_args(argv)
 
     results = asyncio.run(
@@ -163,6 +188,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             port=args.port,
             timeout=args.timeout,
             kvswitch=args.kvswitch,
+            max_retries=args.max_retries,
         )
     )
     print(json.dumps(results))
