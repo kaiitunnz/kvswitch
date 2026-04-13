@@ -12,7 +12,25 @@ automatically on first run.
 - Compiled P4 artifacts in `build/p4/kvswitch/` (included in the repo)
 - ShareGPT dataset at `data/ShareGPT_V3_unfiltered_cleaned_split.json`
   ([download](https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/blob/main/ShareGPT_V3_unfiltered_cleaned_split.json))
+- Access to `meta-llama/Llama-3.2-3B-Instruct` on HuggingFace ([request access](https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct))
 - HuggingFace model cache (for tokenizer; downloaded on first run)
+
+### Pre-computed results
+
+We provide evaluation results ([download](https://drive.google.com/file/d/1PXIASia686i2M-tb8rsTdVkEaQNiVlBy/view?usp=sharing)) containing all raw results, profiling traces, experimental logs, and generated figures.
+
+To use the pre-computed results, extract the archive into the repository root:
+
+```bash
+unzip kvswitch-results.zip -d .
+```
+
+This populates [`results/`](./results/) with experiment data and figures. You can then
+rerun the analysis notebooks (see [notebooks](./notebooks/)) without running experiments:
+
+```bash
+jupyter notebook notebooks/result_analysis.ipynb
+```
 
 ### Run all experiments
 
@@ -30,7 +48,8 @@ bash exp/run_exp.sh 2          # End-to-end: rate sweep
 bash exp/run_exp.sh 3a         # Ablation: ECMP vs pinning
 bash exp/run_exp.sh 3b         # Ablation: warm-up impact
 bash exp/run_exp.sh 4a         # Sensitivity: prefix sharing ratio
-bash exp/run_exp.sh 4b         # Sensitivity: resource constraints
+bash exp/run_exp.sh 4b         # Sensitivity: KV cache capacity
+bash exp/run_exp.sh 4c         # Sensitivity: number of workers
 bash exp/run_exp.sh 2 4b       # Multiple experiments
 ```
 
