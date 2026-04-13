@@ -1235,7 +1235,12 @@ def main() -> None:
     parser.add_argument("--admission-threshold", type=int, default=2)
     parser.add_argument("--max-num-seqs", type=int, default=256)
     parser.add_argument("--max-num-batched-tokens", type=int, default=8192)
-    parser.add_argument("--kv-cache-capacity", type=int, default=8192)
+    parser.add_argument(
+        "--kv-cache-capacity",
+        type=int,
+        default=8192,
+        help="KV cache capacity in tokens per worker (0 for unlimited)",
+    )
     parser.add_argument("--coalesce-interval-s", type=float, default=0.5)
     parser.add_argument("--load-update-interval-ms", type=float, default=100.0)
     parser.add_argument("--load-update-delta", type=int, default=100)
@@ -1255,6 +1260,10 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log-level", type=str, default="INFO")
     args = parser.parse_args()
+
+    # Treat 0 as unlimited KV cache capacity.
+    if args.kv_cache_capacity == 0:
+        args.kv_cache_capacity = None
 
     setup_logging(args.log_level)
     logger.info("Using Python: %s", PYTHON)

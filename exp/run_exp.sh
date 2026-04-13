@@ -12,7 +12,8 @@
 #   3a  Ablation: ECMP vs pinning
 #   3b  Ablation: warm-up impact
 #   4a  Sensitivity: prefix sharing ratio
-#   4b  Sensitivity: resource constraints
+#   4b  Sensitivity: KV cache capacity
+#   4c  Sensitivity: number of workers
 
 set -euo pipefail
 
@@ -32,15 +33,20 @@ ALL4="l4_ecmp,l7_rr,l7_pa,kvswitch"
 CONSTRAINED=(--max-num-seqs 4 --max-num-batched-tokens 2048)
 
 # --- Helpers ---
+LOGS_DIR="${LOGS_DIR:-results/logs}"
+
 run() {
     local name=$1; shift
     local outdir="$RESULTS_BASE/$name"
+    local logfile="$LOGS_DIR/$(echo "$name" | tr '/' '_').log"
+    mkdir -p "$(dirname "$logfile")"
     echo ""
     echo "============================================================"
     echo "  Experiment: $name"
     echo "  Output:     $outdir"
+    echo "  Log:        $logfile"
     echo "============================================================"
-    $EVAL --output-dir "$outdir" "$@"
+    $EVAL --output-dir "$outdir" "$@" 2>&1 | tee "$logfile"
 }
 
 # --- Experiment definitions ---
@@ -71,13 +77,13 @@ exp_3a() {
         --num-requests 500 --request-rate 200 \
         --warmup-per-group 20 \
         --no-per-prefix-ecmp \
-        "${COMMON[@]}" "${SLOW[@]}" "${CONSTRAINED[@]}"
+        "${COMMON[@]}" "${MEDIUM[@]}"
 }
 
 exp_3b() {
     echo ">>> 3b. Ablation: warm-up impact"
     run "3b_warmup_ablation/no_warmup" \
-        --baselines l4_ecmp,l7_pa,kvswitch \
+        --baselines "$ALL4" \
         --num-requests 500 --request-rate 200 \
         --warmup-per-group 0 \
         "${COMMON[@]}" "${MEDIUM[@]}"
@@ -87,7 +93,7 @@ exp_4a() {
     echo ">>> 4a. Sensitivity: prefix sharing ratio"
     for ratio in 0.2 0.4 0.6 0.8; do
         run "4a_prefix_sharing/ratio_${ratio}" \
-            --baselines l4_ecmp,l7_pa,kvswitch \
+            --baselines "$ALL4" \
             --num-requests 500 --request-rate 10 \
             --prefix-sharing-ratio "$ratio" \
             --warmup-per-group 0 \
@@ -96,20 +102,41 @@ exp_4a() {
 }
 
 exp_4b() {
-    echo ">>> 4b. Sensitivity: resource constraints"
-    for rate in 100 200; do
-        run "4b_constraints/rate_${rate}" \
+    echo ">>> 4b. Sensitivity: KV cache capacity"
+    for cap in 4096 8192 16384 0; do
+        local label=$cap
+        local batched=8192
+        if [ "$cap" -eq 0 ]; then
+            label="unlimited"
+        elif [ "$cap" -lt "$batched" ]; then
+            batched=$cap
+        fi
+        run "4b_kv_capacity/cap_${label}" \
             --baselines "$ALL4" \
-            --num-requests 500 --request-rate "$rate" \
+            --num-requests 500 --request-rate 200 \
             --warmup-per-group 20 \
-            "${COMMON[@]}" "${SLOW[@]}" "${CONSTRAINED[@]}"
+            --kv-cache-capacity "$cap" \
+            --max-num-batched-tokens "$batched" \
+            "${COMMON[@]}" "${MEDIUM[@]}"
+    done
+}
+
+exp_4c() {
+    echo ">>> 4c. Sensitivity: number of workers"
+    for nw in 4 8 12 16; do
+        run "4c_workers/workers_$((nw * 2))" \
+            --baselines "$ALL4" \
+            --num-requests 500 --request-rate 200 \
+            --warmup-per-group 20 \
+            --n-worker-leaves 2 --workers-per-leaf "$nw" \
+            "${COMMON[@]}" "${MEDIUM[@]}"
     done
 }
 
 # --- Main ---
-EXPERIMENTS=("${@:-1 2 3a 3b 4a 4b}")
+EXPERIMENTS=("${@:-1 2 3a 3b 4a 4b 4c}")
 if [ $# -eq 0 ]; then
-    EXPERIMENTS=(1 2 3a 3b 4a 4b)
+    EXPERIMENTS=(1 2 3a 3b 4a 4b 4c)
 fi
 
 echo "Running experiments: ${EXPERIMENTS[*]}"
@@ -123,6 +150,7 @@ for exp in "${EXPERIMENTS[@]}"; do
         3b) exp_3b ;;
         4a) exp_4a ;;
         4b) exp_4b ;;
+        4c) exp_4c ;;
         *)  echo "Unknown experiment: $exp"; exit 1 ;;
     esac
 done
