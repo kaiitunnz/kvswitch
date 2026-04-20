@@ -117,7 +117,7 @@ control KVSwitchIngress(
         default_action = drop();
     }
 
-    // Leaf prefix match: maps (h0, h1, h2) to a per-prefix leaf ECMP group.
+    // Leaf prefix match: maps (h0, h1, h2, h3) to a per-prefix leaf ECMP group.
     table leaf_prefix_route {
         key = {
             hdr.kvswitch.h0: ternary;
