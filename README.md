@@ -1,5 +1,15 @@
 # KVSwitch: Accelerating Distributed LLM Inference with In-Network Prefix-Aware Routing
 
+KVSwitch offloads prefix-aware routing for distributed LLM inference from centralized layer-7 routers into the network fabric itself. A client SDK tokenizes each prompt, computes a cumulative prefix hash chain, and embeds it in a compact shim header. Programmable switches perform hierarchical TCAM matching and per-prefix weighted ECMP routing at line rate, coordinated by a cache-event-driven SDN controller that keeps the forwarding state synchronized with distributed KV cache state.
+
+<p align="center">
+  <img src="assets/kvswitch.png" alt="KVSwitch architecture" width="50%"/>
+  <br>
+  <em>Architecture overview of KVSwitch.</em>
+</p>
+
+This repository contains a research prototype built on BMv2 and Mininet with a trace-driven LLM serving simulator. On its evaluation topology, KVSwitch reduces median TTFT by up to 27% and tail TTFT by up to 76% relative to a state-of-the-art layer-7 prefix-aware router.
+
 ## Running Experiments
 
 Experiments run inside Docker with a pre-built Mininet + BMv2 image. **No
